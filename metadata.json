@@ -1,0 +1,6 @@
+{
+  "name": "VerdeGrana Pro",
+  "description": "Smart Cloud-First budget management system with Supabase Auth/DB, Netlify Ready, and PT-BR UI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["storage", "ai"]
+}
