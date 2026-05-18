@@ -1748,16 +1748,23 @@ export default function App() {
       
       setAuditLogs(prev => {
         const combined = [...mappedLogs];
-        // Only keep local logs that are very recent (> 30s) and not in the cloud yet
-        // to avoid "disappearing logs" during sync race conditions
         const now = new Date().getTime();
+        
+        // Merge strategy: Keep everything from cloud, 
+        // PLUS very recent local logs (> 60s) that haven't hit cloud yet.
         prev.forEach(p => {
-          const isRecent = (now - new Date(p.timestamp).getTime()) < 30000;
-          if (isRecent && !combined.some(c => c.id === p.id || c.metadata === p.metadata)) {
+          const isRecent = (now - new Date(p.timestamp).getTime()) < 60000;
+          const alreadyInCloud = combined.some(c => c.id === p.id);
+          
+          if (isRecent && !alreadyInCloud) {
             combined.push(p);
           }
         });
-        const next = combined.sort((a,b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()).slice(0, 500);
+        
+        const next = combined
+          .sort((a,b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+          .slice(0, 500);
+          
         localStorage.setItem('verdegrana_audit_trail', JSON.stringify(next));
         return next;
       });
@@ -1908,7 +1915,10 @@ export default function App() {
     setUser(null);
     setIsCloudMode(false);
     setTransactions([]);
+    setAuditLogs([]);
     setCategories(DEFAULT_CATEGORIES.map(c => ({ id: c.toLowerCase(), name: c })));
+    setProfilesList(['Principal']);
+    setActiveProfile('Principal');
     
     try {
       const db = await initDB();
@@ -2183,6 +2193,17 @@ export default function App() {
         // Only react if it's from another instance of the same user
         if (senderId === user.id && senderClientId !== clientId) {
           console.log('⚡ Real-time Sync Broadcast Received (Source: other instance):', payload);
+          
+          if (payload?.payload?.type === 'full_reset' || payload?.type === 'full_reset') {
+            console.warn('⚠️ FULL RESET DETECTED. Clearing all local data...');
+            localStorage.clear();
+            setTransactions([]);
+            setAuditLogs([]);
+            setProfilesList(['Principal']);
+            setTimeout(() => window.location.reload(), 2000);
+            return;
+          }
+
           // Wait a bit for DB to catch up if it's a structural change
           setTimeout(() => fetchCloudData(user.id), 1000);
         }
@@ -2384,6 +2405,10 @@ export default function App() {
         return next;
       });
 
+      // Audit log for AI import
+      const summary = `Importação IA: ${createdCount} novos, ${mergedCount} vinculados`;
+      logAudit('Inserção', activeProfile, summary);
+
       // Bulk cloud sync
       if (isCloudMode && user && supabase) {
         setSyncStatus('saving');
@@ -2408,6 +2433,12 @@ export default function App() {
             toast.error("Erro ao sincronizar lote: " + error.message);
           } else {
             setSyncStatus('synced');
+            // Notify other devices
+            supabase.channel('verdegrana_sync').send({
+              type: 'broadcast',
+              event: 'sync',
+              payload: { userId: user.id, clientId, type: 'ai_import' }
+            });
           }
         });
       }
@@ -4137,12 +4168,24 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                         action: async () => {
                           setBootStage('syncing');
                           
-                          // 1. Cloud Wipe
+                          // 1. Cloud Wipe (Strict)
                           if (user && supabase && isCloudMode) {
                             try {
+                              // Notify others BEFORE wipe so they can prepare to clear cache
+                              supabase.channel('verdegrana_sync').send({
+                                type: 'broadcast',
+                                event: 'sync',
+                                payload: { userId: user.id, clientId, type: 'full_reset' }
+                              });
+
                               await Promise.all([
                                 supabase.from('transactions').delete().eq('user_id', user.id),
-                                supabase.from('profiles').delete().eq('user_id', user.id)
+                                supabase.from('profiles').delete().eq('user_id', user.id),
+                                supabase.from('audit_logs').delete().eq('user_id', user.id),
+                                supabase.from('userdata').update({ 
+                                  data: { auditLogs: [], profilesList: ['Principal'], categories: [] },
+                                  updated_at: new Date().toISOString()
+                                }).eq('user_id', user.id)
                               ]);
                             } catch (e) {
                               console.error('Falha ao limpar nuvem:', e);
