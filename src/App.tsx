@@ -1795,19 +1795,29 @@ export default function App() {
       setTransactions(prev => {
         const next = [...mappedTxs];
         const now = new Date().getTime();
-        // Additive logic: Keep local transactions that are very new (> 20s) and not yet in cloud
+        
+        // IDs currently in sync queue (pending upload)
+        const pendingIds = new Set(syncQueue.filter(q => q.type === 'tx_add' || q.type === 'tx_update').map(q => q.payload.id || q.payload));
+
         prev.forEach(p => {
-          const isStaleInCloud = next.some(n => n.id === p.id && new Date(n.updatedAt).getTime() < new Date(p.updatedAt).getTime());
-          const isMissingInCloud = !next.some(n => n.id === p.id);
-          const isVeryNew = (now - new Date(p.updatedAt).getTime()) < 20000;
+          const cloudEntry = next.find(n => n.id === p.id);
+          const isMissingInCloud = !cloudEntry;
+          const isStaleInCloud = cloudEntry && new Date(cloudEntry.updatedAt).getTime() < new Date(p.updatedAt || 0).getTime();
           
-          if (isStaleInCloud) {
-             // Overwrite stale cloud entry with newer local entry
+          // Protection logic:
+          // 1. If it's in the sync queue, we MUST keep local version as it's more definitive/recent
+          // 2. If it's missing in cloud but was created recently (< 5 mins), keep it
+          // 3. If it's stale in cloud (local is newer), overwrite cloud with local
+          const isPending = pendingIds.has(p.id);
+          const isVeryNew = (now - new Date(p.updatedAt || 0).getTime()) < 300000; // 5 minute window
+          
+          if (isStaleInCloud || (isMissingInCloud && (isVeryNew || isPending))) {
              const idx = next.findIndex(n => n.id === p.id);
-             next[idx] = p;
-          } else if (isMissingInCloud && isVeryNew) {
-             // Keep local entry that hasn't hit cloud yet
-             next.push(p);
+             if (idx !== -1) {
+                next[idx] = p;
+             } else {
+                next.push(p);
+             }
           }
         });
         localStorage.setItem('verdegrana_data', JSON.stringify(next));
@@ -2077,15 +2087,12 @@ export default function App() {
   useEffect(() => {
     if (!supabase || !isCloudMode || !user) return;
 
-    // Listen for transaction changes
-    const txChannel = supabase.channel('realtime_transactions')
+    // Unified Real-time Channel (Transactions, Audit Logs, Metadata, Broadcasts)
+    const channel = supabase.channel(`verdegrana_all_${user.id}`)
       .on('postgres_changes', { 
-        event: 'INSERT', 
-        schema: 'public', 
-        table: 'transactions',
-        filter: `user_id=eq.${user.id}`
+        event: 'INSERT', schema: 'public', table: 'transactions', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
-        console.log('Real-time INSERT:', payload);
+        console.log('Real-time Channel: Transaction INSERT', payload);
         const newTx = mapCloudTxToLocal(payload.new);
         setTransactions(prev => {
           if (prev.some(t => t.id === newTx.id)) return prev;
@@ -2096,12 +2103,9 @@ export default function App() {
         toast.info(`⚡ Novo lançamento: ${newTx.desc}`, { duration: 2000 });
       })
       .on('postgres_changes', { 
-        event: 'UPDATE', 
-        schema: 'public', 
-        table: 'transactions',
-        filter: `user_id=eq.${user.id}`
+        event: 'UPDATE', schema: 'public', table: 'transactions', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
-        console.log('Real-time UPDATE:', payload);
+        console.log('Real-time Channel: Transaction UPDATE', payload);
         const updatedTx = mapCloudTxToLocal(payload.new);
         setTransactions(prev => {
           const next = prev.map(t => t.id === updatedTx.id ? updatedTx : t);
@@ -2110,12 +2114,9 @@ export default function App() {
         });
       })
       .on('postgres_changes', { 
-        event: 'DELETE', 
-        schema: 'public', 
-        table: 'transactions',
-        filter: `user_id=eq.${user.id}`
+        event: 'DELETE', schema: 'public', table: 'transactions', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
-        console.log('Real-time DELETE:', payload);
+        console.log('Real-time Channel: Transaction DELETE', payload);
         const deletedId = payload.old.id;
         setTransactions(prev => {
           const next = prev.filter(t => t.id !== deletedId);
@@ -2123,22 +2124,8 @@ export default function App() {
           return next;
         });
       })
-      .subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') console.log('Realtime Transactions Subscribed');
-        if (status === 'CHANNEL_ERROR') {
-          console.warn('Realtime Transactions Connection Error');
-          // Fallback to manual sync if channel fails
-          setTimeout(() => fetchCloudData(user.id), 1000);
-        }
-      });
-
-    // Listen for audit log changes
-    const logsChannel = supabase.channel('realtime_audit')
       .on('postgres_changes', { 
-        event: 'INSERT', 
-        schema: 'public', 
-        table: 'audit_logs',
-        filter: `user_id=eq.${user.id}`
+        event: 'INSERT', schema: 'public', table: 'audit_logs', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
         const log = payload.new;
         setAuditLogs(prev => {
@@ -2154,56 +2141,15 @@ export default function App() {
         });
       })
       .on('postgres_changes', { 
-        event: 'DELETE', 
-        schema: 'public', 
-        table: 'audit_logs',
-        filter: `user_id=eq.${user.id}`
+        event: 'DELETE', schema: 'public', table: 'audit_logs', filter: `user_id=eq.${user.id}` 
       }, () => {
-        // If logs are cleared on another device
         setAuditLogs([]);
         localStorage.removeItem('verdegrana_audit_trail');
       })
-      .subscribe((status: string) => {
-        if (status === 'CHANNEL_ERROR') console.warn('Realtime Audit Log Connection Error');
-      });
-
-    // Broadcast channel for non-DB event triggers (backup sync)
-    const syncChannel = supabase.channel('verdegrana_sync')
-      .on('broadcast', { event: 'sync' }, (payload: any) => {
-        const senderId = payload?.payload?.userId || payload?.userId;
-        const senderClientId = payload?.payload?.clientId || payload?.clientId;
-        
-        // Only react if it's from another instance of the same user
-        if (senderId === user.id && senderClientId !== clientId) {
-          console.log('⚡ Real-time Sync Broadcast Received (Source: other instance):', payload);
-          
-          if (payload?.payload?.type === 'full_reset' || payload?.type === 'full_reset') {
-            console.warn('⚠️ FULL RESET DETECTED. Clearing all local data...');
-            localStorage.clear();
-            setTransactions([]);
-            setAuditLogs([]);
-            setProfilesList(['Principal']);
-            setTimeout(() => window.location.reload(), 2000);
-            return;
-          }
-
-          // Wait a bit for DB to catch up if it's a structural change
-          setTimeout(() => fetchCloudData(user.id), 1000);
-        }
-      })
-      .subscribe((status: string) => {
-        if (status === 'SUBSCRIBED') console.log('Realtime Sync Channel Subscribed');
-      });
-
-    // Combined metadata listener (Categories, Profiles, Fallsback Logs)
-    const metaChannel = supabase.channel('realtime_meta')
       .on('postgres_changes', {
-        event: 'UPDATE',
-        schema: 'public',
-        table: 'userdata',
-        filter: `user_id=eq.${user.id}`
+        event: 'UPDATE', schema: 'public', table: 'userdata', filter: `user_id=eq.${user.id}`
       }, (payload: any) => {
-        console.log('⚡ Real-time Userdata Update:', payload);
+        console.log('Real-time Channel: Userdata UPDATE', payload);
         const newData = payload.new.data;
         if (newData?.categories) {
           setCategories(newData.categories);
@@ -2218,13 +2164,30 @@ export default function App() {
           localStorage.setItem('verdegrana_audit_trail', JSON.stringify(newData.auditLogs));
         }
       })
-      .subscribe();
+      .on('broadcast', { event: 'sync' }, (payload: any) => {
+        const senderId = payload?.payload?.userId || payload?.userId;
+        const senderClientId = payload?.payload?.clientId || payload?.clientId;
+        
+        if (senderId === user.id && senderClientId !== clientId) {
+          console.log('Real-time Channel: SYNC Broadcast Received', payload);
+          if (payload?.payload?.type === 'full_reset' || payload?.type === 'full_reset') {
+            localStorage.clear();
+            window.location.reload();
+            return;
+          }
+          // Refresh background data
+          setTimeout(() => fetchCloudData(user.id), 1500);
+        }
+      })
+      .subscribe((status: string) => {
+        console.log(`Real-time Channel Status (${user.id}):`, status);
+        if (status === 'CHANNEL_ERROR') {
+          setTimeout(() => fetchCloudData(user.id), 2000);
+        }
+      });
 
     return () => {
-      supabase.removeChannel(txChannel);
-      supabase.removeChannel(logsChannel);
-      supabase.removeChannel(metaChannel);
-      supabase.removeChannel(syncChannel);
+      supabase.removeChannel(channel);
     };
   }, [isCloudMode, user, supabase]);
 
@@ -3036,7 +2999,9 @@ export default function App() {
                 try {
                   if (isCloudMode && user && supabase) {
                     await supabase.from('profiles').insert([{ name, user_id: user.id }]);
-                  } else if (folderHandle) {
+                  } 
+                  
+                  if (folderHandle) {
                     const fileHandle = await folderHandle.getFileHandle(`${name}.json`, { create: true });
                     const writable = await fileHandle.createWritable();
                     await writable.write(JSON.stringify({ transactions: [], categories }, null, 2));
@@ -3059,6 +3024,16 @@ export default function App() {
             >
               {isAuthLoading ? <RefreshCw className="w-5 h-5 animate-spin" /> : 'CRIAR MEU PRIMEIRO PERFIL'} <ArrowRight className="w-5 h-5" />
             </button>
+
+            {!folderHandle && (
+              <button 
+                onClick={handleFolderSelection}
+                className="w-full py-4 bg-white/5 border border-white/10 rounded-2xl text-[10px] text-slate-500 font-black uppercase tracking-widest hover:bg-white/10 transition-all flex items-center justify-center gap-2"
+              >
+                <FolderSync className="w-4 h-4" /> Vincular Pasta Local (Opcional)
+              </button>
+            )}
+
             <button 
               onClick={handleLogout}
               className="text-[10px] text-slate-600 font-bold uppercase tracking-widest hover:text-slate-400 transition-all"
@@ -4046,8 +4021,8 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                     </div>
 
                     <div className="space-y-4 relative z-10 flex-1">
-                      {isCloudMode ? (
-                        <div className="space-y-4">
+                      {isCloudMode && user ? (
+                        <div className="space-y-6">
                            <div className="bg-white/5 p-6 rounded-3xl border border-white/5 space-y-4">
                               <div className="flex items-center gap-4">
                                  <div className="w-12 h-12 rounded-full bg-emerald-500/10 flex items-center justify-center text-emerald-500">
@@ -4065,6 +4040,24 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                                 <p className="text-[9px] text-emerald-500/60 font-medium uppercase mt-2">Sincronização em tempo real ativa</p>
                               </div>
                            </div>
+
+                           {!folderHandle && (
+                              <button 
+                                onClick={handleFolderSelection}
+                                className="w-full py-4 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-emerald-400 font-black uppercase text-xs hover:bg-emerald-500/20 transition-all flex items-center justify-center gap-2"
+                              >
+                                <FolderSync className="w-4 h-4" /> Ativar Backup em Pasta Local
+                              </button>
+                           )}
+                           {folderHandle && (
+                             <div className="p-4 bg-emerald-500/5 border border-emerald-500/20 rounded-xl flex items-center justify-between">
+                                <div className="flex items-center gap-3">
+                                  <FolderSync className="w-4 h-4 text-emerald-500" />
+                                  <span className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">Pasta Local Ativa</span>
+                                </div>
+                                <button onClick={() => setFolderHandle(null)} className="text-[10px] font-bold text-slate-500 hover:text-white uppercase transition-colors">Desvincular</button>
+                             </div>
+                           )}
                         </div>
                       ) : (
                         <div className="space-y-6">
