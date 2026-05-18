@@ -705,13 +705,33 @@ export default function App() {
     description: string;
     action: () => void;
   }>({ open: false, title: '', description: '', action: () => {} });
-  const [transactions, setTransactions] = useState<Transaction[]>(() => {
-    const saved = localStorage.getItem('verdegrana_data');
-    if (!saved) return [];
+  const safeSave = useCallback((key: string, data: any) => {
     try {
+      localStorage.setItem(key, JSON.stringify(data));
+    } catch (e) {
+      if (e instanceof Error && e.name === 'QuotaExceededError') {
+        console.warn(`LocalStorage quota exceeded for ${key}. Clearing older logs and retrying...`);
+        // Emergency purge: Clear non-essential large lists
+        localStorage.removeItem('verdegrana_audit_trail');
+        try {
+          localStorage.setItem(key, JSON.stringify(data));
+        } catch (retryError) {
+          console.error("Critical: Could not save even after purge.", retryError);
+          // Last resort: clear history too
+          setHistory([]);
+          setHistoryPointer(-1);
+          localStorage.removeItem('verdegrana_categories');
+        }
+      }
+    }
+  }, []);
+
+  const [transactions, setTransactions] = useState<Transaction[]>(() => {
+    try {
+      const saved = localStorage.getItem('verdegrana_data');
+      if (!saved) return [];
       const parsed = JSON.parse(saved);
       if (!Array.isArray(parsed)) return [];
-      // Data migration for new fields
       return parsed.map((t: any) => ({
         ...t,
         status: t.status || 'realizado',
@@ -721,9 +741,16 @@ export default function App() {
       return [];
     }
   });
+
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>(() => {
-    const saved = localStorage.getItem('verdegrana_audit_trail');
-    return saved ? JSON.parse(saved) : [];
+    try {
+      const saved = localStorage.getItem('verdegrana_audit_trail');
+      if (!saved) return [];
+      const parsed = JSON.parse(saved);
+      return Array.isArray(parsed) ? parsed.slice(0, 500) : [];
+    } catch {
+      return [];
+    }
   });
   const [history, setHistory] = useState<Transaction[][]>([]);
   const [historyPointer, setHistoryPointer] = useState(-1);
@@ -1053,11 +1080,11 @@ export default function App() {
   const pushToHistory = useCallback((newTransactions: Transaction[]) => {
     setHistory(prev => {
       const newHistory = prev.slice(0, historyPointer + 1);
-      newHistory.push(newTransactions);
-      if (newHistory.length > 50) newHistory.shift();
-      return newHistory;
+      newHistory.push([...newTransactions]);
+      // Limit history to 30 steps to prevent quota issues and memory bloat
+      return newHistory.length > 30 ? newHistory.slice(-30) : newHistory;
     });
-    setHistoryPointer(prev => Math.min(prev + 1, 49));
+    setHistoryPointer(prev => Math.min(prev + 1, 29));
   }, [historyPointer]);
 
   const undo = async () => {
@@ -1173,16 +1200,16 @@ export default function App() {
 
   // Sync state to LocalStorage (Instant Persistence)
   useEffect(() => {
-    localStorage.setItem('verdegrana_data', JSON.stringify(transactions));
-  }, [transactions]);
+    safeSave('verdegrana_data', transactions);
+  }, [transactions, safeSave]);
 
   useEffect(() => {
-    localStorage.setItem('verdegrana_categories', JSON.stringify(categories));
-  }, [categories]);
+    safeSave('verdegrana_categories', categories);
+  }, [categories, safeSave]);
 
   useEffect(() => {
-    localStorage.setItem('verdegrana_profiles_list', JSON.stringify(profilesList));
-  }, [profilesList]);
+    safeSave('verdegrana_profiles_list', profilesList);
+  }, [profilesList, safeSave]);
 
   // Sync state to IDB (Instant)
   useEffect(() => {
@@ -1490,7 +1517,7 @@ export default function App() {
     
     setAuditLogs(prev => {
       const next = [newLog, ...prev].slice(0, 500); // Limit to 500 logs
-      localStorage.setItem('verdegrana_audit_trail', JSON.stringify(next));
+      safeSave('verdegrana_audit_trail', next);
       return next;
     });
 
@@ -1993,6 +2020,17 @@ export default function App() {
   useEffect(() => {
     const boot = async () => {
       try {
+        // Recovery logic: if localStorage is full, clear logs to make room for session
+        try {
+          const testKey = 'verdegrana_test_quota';
+          localStorage.setItem(testKey, '1');
+          localStorage.removeItem(testKey);
+        } catch (e) {
+          console.warn("LocalStorage issue detected during boot. Purging logs for recovery.");
+          localStorage.removeItem('verdegrana_audit_trail');
+          // No reload here, let it continue to boot
+        }
+
         const db = await initDB();
         const persisted = await getState(db);
 
@@ -2107,7 +2145,7 @@ export default function App() {
         setTransactions(prev => {
           if (prev.some(t => t.id === newTx.id)) return prev;
           const next = [...prev, newTx];
-          localStorage.setItem('verdegrana_data', JSON.stringify(next));
+          safeSave('verdegrana_data', next);
           return next;
         });
         toast.info(`⚡ Novo lançamento: ${newTx.desc}`, { duration: 2000 });
@@ -2122,7 +2160,7 @@ export default function App() {
         const updatedTx = mapCloudTxToLocal(payload.new);
         setTransactions(prev => {
           const next = prev.map(t => t.id === updatedTx.id ? updatedTx : t);
-          localStorage.setItem('verdegrana_data', JSON.stringify(next));
+          safeSave('verdegrana_data', next);
           return next;
         });
       })
@@ -4005,6 +4043,14 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                                         
                                         const newList = profilesList.filter(item => item !== p);
                                         setProfilesList(newList);
+
+                                        // Ensure transactions are also cleared from state
+                                        setTransactions(prev => {
+                                          const next = prev.filter(t => t.profile_name !== p);
+                                          pushToHistory(next);
+                                          return next;
+                                        });
+
                                         if (activeProfile === p) {
                                            const next = newList[0] || 'Principal';
                                            setActiveProfile(next);
