@@ -158,6 +158,13 @@ interface AuditLog {
   };
 }
 
+interface SyncTask {
+  id: string;
+  type: 'tx_add' | 'tx_update' | 'tx_delete' | 'audit' | 'metadata' | 'ai_import';
+  payload: any;
+  retryCount: number;
+}
+
 interface Category {
   name: string;
   id: string;
@@ -836,6 +843,15 @@ export default function App() {
   };
   
   const [syncStatus, setSyncStatus] = useState<'idle' | 'synced' | 'saving' | 'error'>('idle');
+  const [syncQueue, setSyncQueue] = useState<SyncTask[]>(() => {
+    try {
+      const saved = localStorage.getItem('verdegrana_sync_queue');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
   const clientId = useMemo(() => crypto.randomUUID(), []);
 
   // UI States
@@ -874,6 +890,90 @@ export default function App() {
   
   // Folder Sync handles
   const [folderHandle, setFolderHandle] = useState<any>(null);
+  
+  useEffect(() => {
+    safeSave('verdegrana_sync_queue', syncQueue);
+  }, [syncQueue, safeSave]);
+
+  const processSyncQueue = useCallback(async () => {
+    if (!supabase || !isCloudMode || !user || syncQueue.length === 0) return;
+    if (!navigator.onLine) {
+        setSyncStatus('idle');
+        return;
+    }
+
+    setSyncStatus('saving');
+    const tasks = [...syncQueue];
+    const successes: string[] = [];
+
+    for (const task of tasks) {
+      try {
+        let error: any = null;
+        if (task.type === 'tx_add') {
+          const { error: err } = await supabase.from('transactions').insert([task.payload]);
+          error = err;
+        } else if (task.type === 'tx_update') {
+          const { error: err } = await supabase.from('transactions').update(task.payload.data).eq('id', task.payload.id);
+          error = err;
+        } else if (task.type === 'tx_delete') {
+          const { error: err } = await supabase.from('transactions').delete().in('id', task.payload.ids);
+          error = err;
+        } else if (task.type === 'audit') {
+          const { error: err } = await supabase.from('audit_logs').insert([task.payload]);
+          error = err;
+        } else if (task.type === 'metadata') {
+           const { data: ud } = await supabase.from('userdata').select('data').eq('user_id', user.id).single();
+           const currentData = ud?.data || {};
+           const { error: err } = await supabase.from('userdata').upsert({ 
+             user_id: user.id, 
+             data: { ...currentData, ...task.payload },
+             updated_at: new Date().toISOString()
+           });
+           error = err;
+        }
+
+        if (!error) {
+          successes.push(task.id);
+          supabase.channel('verdegrana_sync').send({
+            type: 'broadcast',
+            event: 'sync',
+            payload: { userId: user.id, clientId, type: task.type }
+          });
+        } else {
+          console.warn(`Task ${task.type} failed (Attempt ${task.retryCount + 1}):`, error);
+          // If it's a conflict or fixed error, we might consider it "done" or increment retry
+          if (error.code === '23505') { // Unique violation already there
+             successes.push(task.id);
+          } else {
+             setSyncQueue(prev => prev.map(t => t.id === task.id ? { ...t, retryCount: t.retryCount + 1 } : t));
+             if (task.retryCount > 10) successes.push(task.id); 
+          }
+        }
+      } catch (e) {
+        console.error("Critical sync task failure:", e);
+        break; 
+      }
+    }
+
+    if (successes.length > 0) {
+      setSyncQueue(prev => prev.filter(t => !successes.includes(t.id)));
+    }
+    setSyncStatus('synced');
+  }, [supabase, isCloudMode, user, syncQueue, clientId]);
+
+  useEffect(() => {
+    const handleOnline = () => processSyncQueue();
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, [processSyncQueue]);
+
+  // Periodic retry for failed tasks
+  useEffect(() => {
+    if (syncQueue.length > 0) {
+      const timer = setTimeout(processSyncQueue, 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [syncQueue.length, processSyncQueue]);
   const [isFolderTutorialOpen, setIsFolderTutorialOpen] = useState(false);
   
   // Reset modal states
@@ -955,66 +1055,11 @@ export default function App() {
 
   const loadProfileData = async (profileName: string) => {
     setSyncStatus('saving');
-    // AGGRESSIVE STATE ISOLATION: Reset before fetching
-    setTransactions([]);
-    setHistory([]);
-    setHistoryPointer(-1);
     
     try {
       if (isCloudMode && user && supabase) {
-        // Load Metadata first for Audit Log fallback access
-        const { data: userMeta } = await supabase.from('userdata').select('data').eq('user_id', user.id).single();
-        if (userMeta?.data?.categories) setCategories(userMeta.data.categories);
-        if (userMeta?.data?.profilesList) setProfilesList(userMeta.data.profilesList);
-
-        // Load Audit Logs (Global across profiles)
-        let mappedLogs: AuditLog[] = [];
-        const { data: cloudLogs, error: logError } = await supabase
-          .from('audit_logs')
-          .select('*')
-          .eq('user_id', user.id)
-          .order('timestamp', { ascending: false })
-          .limit(500);
-        
-        if (!logError && cloudLogs && cloudLogs.length > 0) {
-          mappedLogs = cloudLogs.map((l: any) => ({
-            id: l.id,
-            timestamp: l.timestamp,
-            operation: l.operation,
-            metadata: l.metadata
-          }));
-        } else if (userMeta?.data?.auditLogs) {
-          mappedLogs = userMeta.data.auditLogs;
-        }
-
-        if (mappedLogs.length > 0) {
-          setAuditLogs(mappedLogs);
-          localStorage.setItem('verdegrana_audit_trail', JSON.stringify(mappedLogs));
-        }
-
-        const { data, error } = await supabase.from('transactions')
-          .select('*')
-          .eq('user_id', user.id)
-          .eq('profile_name', profileName); // Aggressive filtering
-        
-        if (error) throw error;
-        const mapped = data.map((t: any) => ({
-          id: t.id,
-          date: t.date,
-          desc: t.description,
-          value: t.amount,
-          category: t.category,
-          type: t.type,
-          profile_name: t.profile_name,
-          status: t.status || 'realizado',
-          is_redutora: t.is_redutora || false,
-          parent_id: t.parent_id,
-          parent_name: t.parent_name,
-          updatedAt: t.updated_at
-        }));
-        setTransactions(mapped);
-        setHistory([mapped]);
-        setHistoryPointer(0);
+        // background sync: fetchCloudData handles merging/reconciliation for ALL profiles
+        await fetchCloudData(user.id);
       } else if (folderHandle) {
         try {
           const fileHandle = await folderHandle.getFileHandle(`${profileName}.json`);
@@ -1022,17 +1067,21 @@ export default function App() {
           const content = await file.text();
           const data = JSON.parse(content);
           if (data.transactions) {
-            setTransactions(data.transactions);
-            setHistory([data.transactions]);
-            setHistoryPointer(0);
+            setTransactions(prev => {
+              const otherProfiles = prev.filter(t => t.profile_name !== profileName);
+              const next = [...otherProfiles, ...data.transactions];
+              setHistory([next]);
+              setHistoryPointer(0);
+              return next;
+            });
           }
         } catch (e) {
-          setTransactions([]); 
+          // Keep existing state if file fails
         }
       }
       setSyncStatus('synced');
     } catch (e) {
-      console.error("Erro ao carregar dados do perfil:", e);
+      console.error("Erro ao sincronizar dados do perfil:", e);
       setSyncStatus('error');
     }
   };
@@ -1522,46 +1571,19 @@ export default function App() {
     });
 
     if (isCloudMode && user && supabase) {
-      // 1. Try dedicated table (optimal for historical reasons)
-      supabase.from('audit_logs').insert([{
-        id: newLog.id,
-        user_id: user.id,
-        timestamp: newLog.timestamp,
-        operation: newLog.operation,
-        metadata: newLog.metadata
-      }]).then(({ error }: { error: any }) => {
-        if (error) {
-          console.warn("Tabela dedicada audit_logs não disponível. Usando fallback userdata.");
-          // 2. Fallback: Update log list in userdata record
-          supabase.from('userdata').select('data').eq('user_id', user.id).single()
-            .then(({ data: ud }) => {
-              const currentData = ud?.data || {};
-              const currentLogs = currentData.auditLogs || [];
-              const nextLogs = [newLog, ...currentLogs].slice(0, 200); 
-              supabase.from('userdata').update({
-                data: { ...currentData, auditLogs: nextLogs },
-                updated_at: new Date().toISOString()
-              }).eq('user_id', user.id).then(({ error: upError }) => {
-                if (upError) console.error("Erro ao atualizar userdata logs:", upError);
-                else {
-                   // Successfully updated userdata fallback, notify others
-                   supabase.channel('verdegrana_sync').send({
-                     type: 'broadcast',
-                     event: 'sync',
-                     payload: { userId: user.id, clientId, type: 'audit' }
-                   });
-                }
-              });
-            });
-        } else {
-          // Successfully updated dedicated table, notify others
-          supabase.channel('verdegrana_sync').send({
-            type: 'broadcast',
-            event: 'sync',
-            payload: { userId: user.id, clientId, type: 'audit' }
-          });
-        }
-      });
+      const task: SyncTask = {
+        id: crypto.randomUUID(),
+        type: 'audit',
+        payload: {
+          id: newLog.id,
+          user_id: user.id,
+          timestamp: newLog.timestamp,
+          operation: newLog.operation,
+          metadata: newLog.metadata
+        },
+        retryCount: 0
+      };
+      setSyncQueue(prev => [...prev, task]);
     }
   }, [isCloudMode, user, supabase, activeProfile, clientId]);
 
@@ -1585,43 +1607,27 @@ export default function App() {
     logAudit('Inserção', activeProfile, data.desc || data.description, data.value || data.amount);
 
     if (isCloudMode && user && supabase) {
-      setSyncStatus('saving');
-      
-      const sanitizedParentId = (data.parent_id && isUUID(data.parent_id)) ? data.parent_id : null;
-
-      supabase.from('transactions').insert([{
-        id: newTx.id, // Use the ID from the consolidated newTx object (already UUID)
-        user_id: user.id,
-        date: data.date,
-        description: data.desc || data.description,
-        category: data.category,
-        type: data.type,
-        amount: data.value || data.amount,
-        profile_name: activeProfile,
-        status: newTx.status,
-        is_redutora: newTx.is_redutora,
-        parent_id: sanitizedParentId,
-        parent_name: data.parent_name || null,
-        updated_at: newTx.updatedAt
-      }]).then(({ error }: { error: any }) => {
-        if (error) {
-          console.error("Erro na sincronização em nuvem (insert):", error);
-          setSyncStatus('error');
-          if (error.code === '23503') {
-            toast.error("Erro de Vínculo: O lançamento pai ainda não foi sincronizado. Tente novamente em instantes.");
-          } else {
-            toast.error("Erro ao salvar na nuvem: " + error.message);
-          }
-        } else {
-          setSyncStatus('synced');
-          // Notify other devices
-          supabase.channel('verdegrana_sync').send({
-            type: 'broadcast',
-            event: 'sync',
-            payload: { userId: user.id, clientId, type: 'tx_add' }
-          });
-        }
-      });
+      const task: SyncTask = {
+        id: crypto.randomUUID(),
+        type: 'tx_add',
+        payload: {
+          id: newTx.id,
+          user_id: user.id,
+          date: data.date,
+          description: data.desc || data.description,
+          category: data.category,
+          type: data.type,
+          amount: data.value || data.amount,
+          profile_name: activeProfile,
+          status: newTx.status,
+          is_redutora: newTx.is_redutora,
+          parent_id: (data.parent_id && isUUID(data.parent_id)) ? data.parent_id : null,
+          parent_name: data.parent_name || null,
+          updated_at: newTx.updatedAt
+        },
+        retryCount: 0
+      };
+      setSyncQueue(prev => [...prev, task]);
     }
     toast.success('Lançamento adicionado!');
   };
@@ -1644,9 +1650,6 @@ export default function App() {
     logAudit('Edição', activeProfile, data.desc || oldDesc, data.value || oldValue);
 
     if (isCloudMode && user && supabase) {
-      setSyncStatus('saving');
-
-      // Build update payload carefully to avoid wiping out fields not present in the partial data
       const updatePayload: any = { updated_at: new Date().toISOString() };
       if (data.date !== undefined) updatePayload.date = data.date;
       if (data.desc !== undefined) updatePayload.description = data.desc;
@@ -1662,25 +1665,13 @@ export default function App() {
         updatePayload.parent_id = (data.parent_id && isUUID(data.parent_id)) ? data.parent_id : null;
       }
 
-      supabase.from('transactions').update(updatePayload).eq('id', id).then(({ error }) => {
-        if (error) {
-          console.error("Erro na sincronização em nuvem (update):", error);
-          setSyncStatus('error');
-          if (error.code === '23503') {
-            toast.error("Erro de Vínculo: O lançamento pai selecionado não existe ou não foi sincronizado.");
-          } else {
-            toast.error("Erro ao atualizar na nuvem: " + error.message);
-          }
-        } else {
-          setSyncStatus('synced');
-          // Notify other devices
-          supabase.channel('verdegrana_sync').send({
-            type: 'broadcast',
-            event: 'sync',
-            payload: { userId: user.id, clientId, type: 'tx_update' }
-          });
-        }
-      });
+      const task: SyncTask = {
+        id: crypto.randomUUID(),
+        type: 'tx_update',
+        payload: { id, data: updatePayload },
+        retryCount: 0
+      };
+      setSyncQueue(prev => [...prev, task]);
     }
   };
 
@@ -1699,26 +1690,15 @@ export default function App() {
     logAudit('Exclusão', profiles.join(', '), `Exclusão de ${deletedCount} registros`);
 
     if (isCloudMode && user && supabase) {
-      setSyncStatus('saving');
       const validIds = ids.filter(isUUID);
       if (validIds.length > 0) {
-        supabase.from('transactions').delete().in('id', validIds).then(({ error }) => {
-          if (error) {
-            console.error("Erro na sincronização em nuvem (delete):", error);
-            setSyncStatus('error');
-            toast.error("Erro ao excluir na nuvem: " + error.message);
-          } else {
-            setSyncStatus('synced');
-            // Notify other devices
-            supabase.channel('verdegrana_sync').send({
-              type: 'broadcast',
-              event: 'sync',
-              payload: { userId: user.id, clientId, type: 'tx_delete' }
-            });
-          }
-        });
-      } else {
-        setSyncStatus('synced');
+        const task: SyncTask = {
+          id: crypto.randomUUID(),
+          type: 'tx_delete',
+          payload: { ids: validIds },
+          retryCount: 0
+        };
+        setSyncQueue(prev => [...prev, task]);
       }
     }
   };
@@ -1845,43 +1825,14 @@ export default function App() {
 
   const saveCloudMetadata = async (userId: string, cats: Category[]) => {
     if (!supabase || !isCloudMode) return;
-    try {
-      setSyncStatus('saving');
-      
-      // Concurrency protection: Fetch current cloud state and merge instead of blind overwrite
-      const { data: ud } = await supabase.from('userdata').select('data').eq('user_id', userId).single();
-      const currentData = ud?.data || {};
-      
-      // Union merge for categories (additive)
-      const cloudCats: Category[] = currentData.categories || [];
-      const mergedCats = [...cats];
-      cloudCats.forEach((cc: Category) => {
-        if (!mergedCats.some(mc => mc.id === cc.id)) mergedCats.push(cc);
-      });
-
-      // Union merge for profiles list (additive)
-      const cloudProfiles: string[] = currentData.profilesList || [];
-      const mergedProfiles = Array.from(new Set([...profilesList, ...cloudProfiles]));
-
-      const { error } = await supabase
-        .from('userdata')
-        .upsert({ 
-          user_id: userId, 
-          data: { ...currentData, categories: mergedCats, profilesList: mergedProfiles },
-          updated_at: new Date().toISOString()
-        });
-      
-      if (error) throw error;
-      setSyncStatus('synced');
-      // Notify other devices about metadata change
-      supabase.channel('verdegrana_sync').send({
-        type: 'broadcast',
-        event: 'sync',
-        payload: { userId: userId, clientId, type: 'metadata' }
-      });
-    } catch (e: any) {
-      setSyncStatus('error');
-    }
+    
+    const task: SyncTask = {
+      id: crypto.randomUUID(),
+      type: 'metadata',
+      payload: { categories: cats, profilesList },
+      retryCount: 0
+    };
+    setSyncQueue(prev => [...prev, task]);
   };
 
   const handleClearAuditLogs = async () => {
@@ -2041,22 +1992,16 @@ export default function App() {
             setUser(session.user);
             setIsCloudMode(true);
             
-            // MODULE 3: Sincronização resiliente com timeout
-            let profiles: string[] = [];
-            try {
-              profiles = await Promise.race([
-                syncProfilesFromCloud(session.user.id),
-                new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
-              ]) as string[];
-            } catch (e) {
-              console.warn("Cloud sync timed out, using fallback.");
-              toast.info('Sincronização lenta... carregando dados locais.');
-            }
-            
-            if (!profiles || profiles.length === 0) {
-              setBootStage('welcome');
-            } else {
+            // ZERO-LOADING: If we have profiles locally, go to profile_select immediately
+            if (profilesList.length > 0) {
               setBootStage('profile_select');
+              // Background sync silently in background
+              syncProfilesFromCloud(session.user.id);
+            } else {
+              // Forced sync if we have nothing local
+              const profiles = await syncProfilesFromCloud(session.user.id);
+              if (!profiles || profiles.length === 0) setBootStage('welcome');
+              else setBootStage('profile_select');
             }
             return;
           }
@@ -3229,12 +3174,14 @@ export default function App() {
                   {isCloudMode && user ? (
                     <div className={cn(
                       "flex items-center gap-2 px-3 py-1.5 rounded-full transition-all",
-                      syncStatus === 'saving' ? "text-amber-500 bg-amber-500/5 animate-pulse" : 
+                      syncStatus === 'saving' || syncQueue.length > 0 ? "text-amber-500 bg-amber-500/5 animate-pulse" : 
                       syncStatus === 'synced' ? "text-emerald-500 bg-emerald-500/10 border border-emerald-500/20" : "text-slate-500 bg-white/5"
                     )}>
-                      {syncStatus === 'saving' ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Cloud className="w-3 h-3" />}
-                      <span>
-                        {syncStatus === 'saving' ? 'SINCRONIZANDO...' : syncStatus === 'synced' ? 'NUVEM ATIVA' : 'SINC. DESATIVADA'}
+                      {syncStatus === 'saving' || syncQueue.length > 0 ? <RefreshCw className="w-3 h-3 animate-spin" /> : <Cloud className="w-3 h-3" />}
+                      <span className="uppercase tracking-widest">
+                        {syncQueue.length > 0 ? `${syncQueue.length} PENDENTE${syncQueue.length > 1 ? 'S' : ''}` :
+                         syncStatus === 'saving' ? 'SINCRONIZANDO...' : 
+                         syncStatus === 'synced' ? 'NUVEM ATIVA' : 'SINC. DESATIVADA'}
                       </span>
                     </div>
                   ) : (
