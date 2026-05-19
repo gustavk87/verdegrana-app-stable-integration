@@ -1125,16 +1125,25 @@ export default function App() {
 
   const mergeProfiles = (current: ProfileInfo[], incoming: ProfileInfo[]): ProfileInfo[] => {
     const map = new Map<string, ProfileInfo>();
-    current.forEach(p => map.set(p.name, p));
+    
+    // Use trimmed and lowercase name as stable key for deduplication
+    const getKey = (name: string) => name.trim().toLowerCase();
+
+    current.forEach(p => {
+      const key = getKey(p.name);
+      map.set(key, { ...p, name: p.name.trim() });
+    });
     
     incoming.forEach(inc => {
-      const existing = map.get(inc.name);
+      const key = getKey(inc.name);
+      const existing = map.get(key);
       if (existing) {
-        if (existing.source !== inc.source) {
-          map.set(inc.name, { name: inc.name, source: 'both' });
+        // If one is cloud and other is local, mark as both
+        if (existing.source !== inc.source && existing.source !== 'both') {
+          map.set(key, { name: inc.name.trim(), source: 'both' });
         }
       } else {
-        map.set(inc.name, inc);
+        map.set(key, { ...inc, name: inc.name.trim() });
       }
     });
     
@@ -1142,21 +1151,26 @@ export default function App() {
   };
 
   const loadProfileData = async (profileName: string) => {
+    if (!profileName) return;
     setSyncStatus('saving');
     
     try {
       if (isCloudMode && user && supabase) {
         // background sync: fetchCloudData handles merging/reconciliation for ALL profiles
         await fetchCloudData(user.id);
-      } else if (folderHandle) {
+      }
+      
+      // Always also try to load from folder if handle exists for this specific profile
+      if (folderHandle) {
         try {
-          const fileHandle = await folderHandle.getFileHandle(`${profileName}.json`);
+          const fileHandle = await folderHandle.getFileHandle(`${profileName.trim()}.json`);
           const file = await fileHandle.getFile();
           const content = await file.text();
+          if (!content) throw new Error("Empty file");
           const data = JSON.parse(content);
           if (data.transactions) {
             setTransactions(prev => {
-              const otherProfiles = prev.filter(t => t.profile_name !== profileName);
+              const otherProfiles = prev.filter(t => t.profile_name !== profileName.trim());
               const next = [...otherProfiles, ...data.transactions];
               setHistory([next]);
               setHistoryPointer(0);
@@ -1164,7 +1178,9 @@ export default function App() {
             });
           }
         } catch (e) {
-          // Keep existing state if file fails
+          console.warn(`Could not load local file for ${profileName}:`, e);
+          // If in cloud mode, we already have some data from fetchCloudData
+          // If not in cloud mode and file fails, we might have empty state which is fine
         }
       }
       setSyncStatus('synced');
@@ -1442,7 +1458,13 @@ export default function App() {
 
   const allProfiles = useMemo(() => {
     const unique = new Map<string, ProfileInfo>();
-    profilesList.forEach(p => unique.set(p.name, p));
+    profilesList.forEach(p => {
+      const key = p.name.trim().toLowerCase();
+      // Keep existing record if already 'both', or if incoming is 'both'
+      const existing = unique.get(key);
+      if (existing && existing.source === 'both') return;
+      unique.set(key, { ...p, name: p.name.trim() });
+    });
     return Array.from(unique.values()).sort((a,b) => a.name.localeCompare(b.name));
   }, [profilesList]);
 
@@ -2099,36 +2121,38 @@ export default function App() {
         };
 
         // 1. Check for Cloud Session
+        let cloudProfiles: ProfileInfo[] = [];
         if (supabase) {
           const { data: { session } } = await supabase.auth.getSession();
           if (session?.user) {
             setUser(session.user);
             setIsCloudMode(true);
-            
-            const profiles = await syncProfilesFromCloud(session.user.id);
-            await ensureDelay();
-            if (!profiles || profiles.length === 0) setBootStage('welcome');
-            else setBootStage('profile_select');
-            return;
+            cloudProfiles = await syncProfilesFromCloud(session.user.id);
           }
         }
 
         // 2. Check for Local Folder
+        let localProfiles: ProfileInfo[] = [];
         if (persisted?.workspaceHandle) {
           try {
             const permission = await (persisted.workspaceHandle as any).queryPermission({ mode: 'readwrite' });
             if (permission === 'granted') {
               setFolderHandle(persisted.workspaceHandle);
-              await syncProfilesFromFolder(persisted.workspaceHandle);
-              await ensureDelay();
-              setBootStage('profile_select');
-              return;
+              localProfiles = await syncProfilesFromFolder(persisted.workspaceHandle);
             } else {
               toast.info('Seus arquivos locais estão bloqueados. Conecte a pasta novamente nas configurações.');
             }
           } catch (e) {
             console.error("Erro ao verificar permissão da pasta:", e);
           }
+        }
+
+        const combinedProfiles = mergeProfiles(cloudProfiles, localProfiles);
+        
+        if (combinedProfiles.length > 0) {
+          await ensureDelay();
+          setBootStage('profile_select');
+          return;
         }
 
         // 3. Hydrate categories and profiles from local (fallback)
@@ -2660,7 +2684,8 @@ export default function App() {
   const fluxoData = useMemo(() => {
     if (filteredTransactions.length === 0) return [];
 
-    const dates = filteredTransactions.map(t => new Date(t.date).getTime());
+    const dates = filteredTransactions.map(t => new Date(t.date).getTime()).filter(d => !isNaN(d));
+    if (dates.length === 0) return [];
     const minD = new Date(Math.min(...dates));
     const maxD = new Date(Math.max(...dates));
 
@@ -2673,17 +2698,19 @@ export default function App() {
       end.setDate(end.getDate() + 2);
 
       let curr = new Date(start);
-      while (curr <= end) {
+      let safety = 0;
+      while (curr <= end && safety < 1000) {
+        safety++;
         const dStr = curr.toISOString().split('T')[0];
         const dayTxs = filteredTransactions.filter(t => t.date === dStr);
-        const income = dayTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value) : Number(t.value)), 0);
-        const expense = dayTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value) : Number(t.value)), 0);
+        const income = dayTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+        const expense = dayTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
         
         results.push({ 
             name: curr.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }), 
             fullDate: curr.toISOString(),
-            income: Math.max(0, income), 
-            expense: Math.max(0, expense) 
+            income: isNaN(income) ? 0 : Math.max(0, income), 
+            expense: isNaN(expense) ? 0 : Math.max(0, expense) 
         });
         curr.setDate(curr.getDate() + 1);
       }
@@ -2692,7 +2719,9 @@ export default function App() {
       const end = analyticsConfig.granularity === 'month' ? new Date(maxD.getFullYear(), maxD.getMonth(), 1) : new Date(maxD.getFullYear(), 0, 1);
 
       let curr = new Date(start);
-      while (curr <= end) {
+      let safety = 0;
+      while (curr <= end && safety < 500) {
+        safety++;
         let income = 0;
         let expense = 0;
         let name = '';
@@ -2705,19 +2734,19 @@ export default function App() {
             const d = new Date(t.date);
             return d.getMonth() === m && d.getFullYear() === y;
           });
-          income = pTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value) : Number(t.value)), 0);
-          expense = pTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value) : Number(t.value)), 0);
+          income = pTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          expense = pTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
           name = curr.toLocaleString('pt-BR', { month: 'short' });
           curr.setMonth(curr.getMonth() + 1);
         } else {
           const y = curr.getFullYear();
           const pTxs = filteredTransactions.filter(t => new Date(t.date).getFullYear() === y);
-          income = pTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value) : Number(t.value)), 0);
-          expense = pTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value) : Number(t.value)), 0);
+          income = pTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          expense = pTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
           name = y.toString();
           curr.setFullYear(curr.getFullYear() + 1);
         }
-        results.push({ name, fullDate, income: Math.max(0, income), expense: Math.max(0, expense) });
+        results.push({ name, fullDate, income: isNaN(income) ? 0 : Math.max(0, income), expense: isNaN(expense) ? 0 : Math.max(0, expense) });
       }
     }
     return results;
@@ -3254,30 +3283,30 @@ export default function App() {
                 </div>
                 
                 <div className="space-y-4">
-                   <button 
-                     onClick={async () => {
-                       const pName = rescueProfile.name;
-                       try {
-                         // @ts-ignore
-                         const handle = await window.showDirectoryPicker();
-                         setFolderHandle(handle);
-                         
-                         // UI feedback starts here
-                         await downloadCloudToFolder(user?.id, handle);
-                         
-                         setActiveProfile(pName);
-                         await loadProfileData(pName);
-                         setBootStage('ready');
-                         setRescueProfile(null);
-                         toast.success('Perfil resgatado com sucesso!');
-                       } catch (e: any) {
-                         if (e.name === 'AbortError') return;
-                         console.error("Erro fatal no resgate:", e);
-                         toast.error("Falha no resgate dos dados. Verifique sua conexão ou a pasta selecionada.");
-                         setBootStage('profile_select'); // Ensure we return to a valid state
-                         setRescueProfile(null);
-                       }
-                     }}
+                    <button 
+                      onClick={async () => {
+                        const pName = rescueProfile.name;
+                        try {
+                          // @ts-ignore
+                          const handle = await window.showDirectoryPicker();
+                          setFolderHandle(handle);
+                          
+                          // UI feedback starts here
+                          await downloadCloudToFolder(user?.id, handle);
+                          
+                          setActiveProfile(pName);
+                          await loadProfileData(pName);
+                          setRescueProfile(null);
+                          setBootStage('ready');
+                          toast.success('Perfil resgatado com sucesso!');
+                        } catch (e: any) {
+                          if (e.name === 'AbortError') return;
+                          console.error("Erro fatal no resgate:", e);
+                          toast.error("Falha no resgate dos dados. Verifique sua conexão ou a pasta selecionada.");
+                          setBootStage('profile_select');
+                          setRescueProfile(null);
+                        }
+                      }}
                      className="w-full py-6 bg-emerald-500 rounded-2xl font-black text-white text-sm uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all"
                    >
                      ESCOLHER PASTA DE DESTINO
