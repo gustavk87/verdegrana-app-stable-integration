@@ -928,58 +928,70 @@ export default function App() {
     setSyncStatus('saving');
     const tasks = [...syncQueue];
     const successes: string[] = [];
+    const failedIds: Record<string, number> = {};
 
-    for (const task of tasks) {
-      try {
-        let error: any = null;
-        if (task.type === 'tx_add') {
-          const { error: err } = await supabase.from('transactions').insert([task.payload]);
-          error = err;
-        } else if (task.type === 'tx_update') {
-          const { error: err } = await supabase.from('transactions').update(task.payload.data).eq('id', task.payload.id);
-          error = err;
-        } else if (task.type === 'tx_delete') {
-          const { error: err } = await supabase.from('transactions').delete().in('id', task.payload.ids);
-          error = err;
-        } else if (task.type === 'audit') {
-          const { error: err } = await supabase.from('audit_logs').insert([task.payload]);
-          error = err;
-        } else if (task.type === 'metadata') {
-           const { data: ud } = await supabase.from('userdata').select('data').eq('user_id', user.id).single();
-           const currentData = ud?.data || {};
-           const { error: err } = await supabase.from('userdata').upsert({ 
-             user_id: user.id, 
-             data: { ...currentData, ...task.payload },
-             updated_at: new Date().toISOString()
-           });
-           error = err;
-        }
-
-        if (!error) {
-          successes.push(task.id);
-          supabase.channel('verdegrana_sync').send({
-            type: 'broadcast',
-            event: 'sync',
-            payload: { userId: user.id, clientId, type: task.type }
-          });
-        } else {
-          console.warn(`Task ${task.type} failed (Attempt ${task.retryCount + 1}):`, error);
-          // If it's a conflict or fixed error, we might consider it "done" or increment retry
-          if (error.code === '23505') { // Unique violation already there
-             successes.push(task.id);
-          } else {
-             setSyncQueue(prev => prev.map(t => t.id === task.id ? { ...t, retryCount: t.retryCount + 1 } : t));
-             if (task.retryCount > 10) successes.push(task.id); 
+    try {
+      for (const task of tasks) {
+        try {
+          let error: any = null;
+          if (task.type === 'tx_add') {
+            const { error: err } = await supabase.from('transactions').insert([task.payload]);
+            error = err;
+          } else if (task.type === 'tx_update') {
+            const { error: err } = await supabase.from('transactions').update(task.payload.data).eq('id', task.payload.id);
+            error = err;
+          } else if (task.type === 'tx_delete') {
+            const { error: err } = await supabase.from('transactions').delete().in('id', task.payload.ids);
+            error = err;
+          } else if (task.type === 'audit') {
+            const { error: err } = await supabase.from('audit_logs').insert([task.payload]);
+            error = err;
+          } else if (task.type === 'metadata') {
+             const { data: ud } = await supabase.from('userdata').select('data').eq('user_id', user.id).single();
+             const currentData = ud?.data || {};
+             const { error: err } = await supabase.from('userdata').upsert({ 
+               user_id: user.id, 
+               data: { ...currentData, ...task.payload },
+               updated_at: new Date().toISOString()
+             });
+             error = err;
           }
+
+          if (!error) {
+            successes.push(task.id);
+            supabase.channel('verdegrana_sync').send({
+              type: 'broadcast',
+              event: 'sync',
+              payload: { userId: user.id, clientId, type: task.type }
+            });
+          } else {
+            console.warn(`Task ${task.type} failed (Attempt ${task.retryCount + 1}):`, error);
+            if (error.code === '23505') { 
+               successes.push(task.id);
+            } else {
+               failedIds[task.id] = task.retryCount + 1;
+            }
+          }
+        } catch (e) {
+          console.error("Individual sync task error:", e);
+          failedIds[task.id] = task.retryCount + 1;
         }
-      } catch (e) {
-        console.error("Critical sync task failure:", e);
-        break; 
       }
+    } catch (e) {
+      console.error("Critical sync loop failure:", e);
     }
 
-    if (successes.length > 0) {
-      setSyncQueue(prev => prev.filter(t => !successes.includes(t.id)));
+    if (successes.length > 0 || Object.keys(failedIds).length > 0) {
+      setSyncQueue(prev => {
+        const next = prev.filter(t => !successes.includes(t.id)).map(t => {
+          if (failedIds[t.id]) {
+            return { ...t, retryCount: failedIds[t.id] };
+          }
+          return t;
+        });
+        // Auto-remove tasks with too many retries
+        return next.filter(t => (t.retryCount || 0) < 10);
+      });
     }
     setSyncStatus('synced');
   }, [supabase, isCloudMode, user, syncQueue, clientId]);
@@ -1089,12 +1101,19 @@ export default function App() {
   };
 
   const syncProfilesFromFolder = async (handle: any) => {
+    if (!handle) return [];
     const profileNames: string[] = [];
     try {
       // @ts-ignore
       for await (const entry of handle.values()) {
-        if (entry.kind === 'file' && entry.name.endsWith('.json')) {
-          profileNames.push(entry.name.replace('.json', ''));
+        if (entry.kind === 'file') {
+          const fileName = entry.name.toLowerCase();
+          if (fileName.endsWith('.json')) {
+            const name = entry.name.slice(0, -5).trim();
+            if (name && name !== 'metadata' && name !== 'categories' && name !== 'userdata') {
+              profileNames.push(name);
+            }
+          }
         }
       }
     } catch (e) {
@@ -1112,7 +1131,10 @@ export default function App() {
       const { data, error } = await supabase.from('profiles').select('name').eq('user_id', userId);
       if (error) throw error;
       
-      const profileNames = Array.from(new Set(data.map((p: any) => p.name))) as string[];
+      // Clean and deduplicate incoming names
+      const profileNames = Array.from(new Set<string>(data.map((p: any) => String(p.name || '').trim())))
+        .filter((name: string) => name.length > 0);
+        
       const cloudProfiles: ProfileInfo[] = profileNames.map(name => ({ name, source: 'cloud' as const }));
       
       setProfilesList(prev => mergeProfiles(prev, cloudProfiles));
@@ -1459,11 +1481,19 @@ export default function App() {
   const allProfiles = useMemo(() => {
     const unique = new Map<string, ProfileInfo>();
     profilesList.forEach(p => {
+      if (!p || !p.name) return;
       const key = p.name.trim().toLowerCase();
       // Keep existing record if already 'both', or if incoming is 'both'
       const existing = unique.get(key);
-      if (existing && existing.source === 'both') return;
-      unique.set(key, { ...p, name: p.name.trim() });
+      if (existing) {
+        if (existing.source === 'both') return;
+        if (p.source !== existing.source) {
+          unique.set(key, { name: p.name.trim(), source: 'both' });
+          return;
+        }
+      } else {
+        unique.set(key, { ...p, name: p.name.trim() });
+      }
     });
     return Array.from(unique.values()).sort((a,b) => a.name.localeCompare(b.name));
   }, [profilesList]);
@@ -1899,20 +1929,7 @@ export default function App() {
         return next;
       });
       
-      const mappedTxs: Transaction[] = cloudTxs ? cloudTxs.map((t: any) => ({
-        id: t.id,
-        date: t.date,
-        desc: t.description,
-        value: t.amount,
-        category: t.category,
-        type: t.type,
-        profile_name: t.profile_name,
-        status: t.status || 'realizado',
-        is_redutora: t.is_redutora || false,
-        parent_id: t.parent_id,
-        parent_name: t.parent_name,
-        updatedAt: t.updated_at || t.updatedAt
-      })) : [];
+      const mappedTxs: Transaction[] = cloudTxs ? cloudTxs.map(mapCloudTxToLocal) : [];
 
       // Reconciliation: Merge instead of direct overwrite to avoid concurrency loss
       setTransactions(prev => {
@@ -1922,7 +1939,7 @@ export default function App() {
         mappedTxs.forEach(t => txMap.set(t.id, t));
         
         const now = new Date().getTime();
-        const pendingIds = new Set(syncQueue.filter(q => q.type === 'tx_add' || q.type === 'tx_update').map(q => q.payload.id || q.payload));
+        const pendingIds = new Set(syncQueue.filter(q => q.type.startsWith('tx_')).map(q => q.payload.id || q.payload));
 
         prev.forEach(p => {
           const cloudEntry = txMap.get(p.id);
@@ -2198,20 +2215,23 @@ export default function App() {
     boot();
   }, []);
 
-  const mapCloudTxToLocal = (t: any): Transaction => ({
-    id: t.id,
-    date: t.date,
-    desc: t.description,
-    value: t.amount,
-    category: t.category,
-    type: t.type,
-    profile_name: t.profile_name,
-    status: t.status || 'realizado',
-    is_redutora: t.is_redutora || false,
-    parent_id: t.parent_id,
-    parent_name: t.parent_name,
-    updatedAt: t.updated_at
-  });
+  const mapCloudTxToLocal = (t: any): Transaction => {
+    const val = Number(t.value || t.amount) || 0;
+    return {
+      id: String(t.id),
+      date: t.date || new Date().toISOString().split('T')[0],
+      desc: (t.desc || t.description || '').trim(),
+      value: isNaN(val) ? 0 : val,
+      category: (t.category || 'Outros').trim(),
+      type: (t.type === 'entrada' ? 'entrada' : 'saída') as TransactionType,
+      profile_name: String(t.profile_name || '').trim(),
+      status: (t.status === 'pendente' ? 'pendente' : 'realizado') as TransactionStatus,
+      is_redutora: !!t.is_redutora,
+      parent_id: t.parent_id,
+      parent_name: t.parent_name,
+      updatedAt: t.updatedAt || t.updated_at
+    };
+  };
 
   // Module 3: Real-time Sync - Channels
   const channelRef = useRef<any>(null);
@@ -2655,30 +2675,38 @@ export default function App() {
   }, [currentTransactions, searchTerm, categoryFilters, sortConfig, updateSortOrder, valueSortOrder]);
 
   const stats = useMemo(() => {
-    const realizedIncome = currentTransactions
-      .filter(t => t.type === 'entrada' && t.status === 'realizado')
-      .reduce((acc, t) => acc + (t.is_redutora ? -t.value : t.value), 0);
-    
-    const realizedExpenses = currentTransactions
-      .filter(t => t.type === 'saída' && t.status === 'realizado')
-      .reduce((acc, t) => acc + (t.is_redutora ? -t.value : t.value), 0);
-    
-    const total = realizedIncome - realizedExpenses;
+    let realizedIncome = 0;
+    let realizedExpenses = 0;
+    let allIncome = 0;
+    let allExpenses = 0;
 
-    const allIncome = currentTransactions
-      .filter(t => t.type === 'entrada')
-      .reduce((acc, t) => acc + (t.is_redutora ? -t.value : t.value), 0);
-    
-    const allExpenses = currentTransactions
-      .filter(t => t.type === 'saída')
-      .reduce((acc, t) => acc + (t.is_redutora ? -t.value : t.value), 0);
-    
+    currentTransactions.forEach(t => {
+      const val = Number(t.value) || 0;
+      const amount = t.is_redutora ? -val : val;
+      
+      if (t.type === 'entrada') {
+        allIncome += amount;
+        if (t.status === 'realizado') realizedIncome += amount;
+      } else if (t.type === 'saída') {
+        allExpenses += amount;
+        if (t.status === 'realizado') realizedExpenses += amount;
+      }
+    });
+
+    const total = realizedIncome - realizedExpenses;
     const projectedTotal = allIncome - allExpenses;
     
     const balanceColor = total > 0 ? 'text-emerald-400' : total < 0 ? 'text-rose-500' : 'text-slate-400';
     const projectedColor = projectedTotal > 0 ? 'text-emerald-500/60' : projectedTotal < 0 ? 'text-rose-500/60' : 'text-slate-500';
 
-    return { total, income: realizedIncome, expenses: realizedExpenses, projectedTotal, balanceColor, projectedColor };
+    return { 
+      total: isNaN(total) ? 0 : total, 
+      income: isNaN(realizedIncome) ? 0 : realizedIncome, 
+      expenses: isNaN(realizedExpenses) ? 0 : realizedExpenses, 
+      projectedTotal: isNaN(projectedTotal) ? 0 : projectedTotal, 
+      balanceColor, 
+      projectedColor 
+    };
   }, [currentTransactions]);
 
   const fluxoData = useMemo(() => {
@@ -2761,26 +2789,37 @@ export default function App() {
     const incByCat: Record<string, number> = {};
     
     currentTransactions.forEach(t => {
-      const val = t.is_redutora ? -t.value : t.value;
+      const val = Number(t.value) || 0;
+      const amount = t.is_redutora ? -val : val;
+      const catName = (t.category || 'Outros').trim();
       if (t.type === 'saída') {
-        expByCat[t.category] = (expByCat[t.category] || 0) + val;
+        expByCat[catName] = (expByCat[catName] || 0) + amount;
       } else {
-        incByCat[t.category] = (incByCat[t.category] || 0) + val;
+        incByCat[catName] = (incByCat[catName] || 0) + amount;
       }
     });
 
     return Object.keys({ ...expByCat, ...incByCat })
       .filter(name => {
-        if (donutViewMode === 'receitas') return (incByCat[name] || 0) > 0;
-        if (donutViewMode === 'despesas') return (expByCat[name] || 0) > 0;
+        const inc = incByCat[name] || 0;
+        const exp = expByCat[name] || 0;
+        if (donutViewMode === 'receitas') return inc > 0;
+        if (donutViewMode === 'despesas') return exp > 0;
         return true;
       })
-      .map(name => ({
-        name,
-        expense: expByCat[name] || 0,
-        income: incByCat[name] || 0,
-        value: donutViewMode === 'receitas' ? (incByCat[name] || 0) : (donutViewMode === 'despesas' ? (expByCat[name] || 0) : (incByCat[name] || 0) + (expByCat[name] || 0))
-      }));
+      .map(name => {
+        const expense = Math.abs(expByCat[name] || 0);
+        const income = Math.abs(incByCat[name] || 0);
+        const value = donutViewMode === 'receitas' ? income : (donutViewMode === 'despesas' ? expense : income + expense);
+        return {
+          name,
+          expense: isNaN(expense) ? 0 : expense,
+          income: isNaN(income) ? 0 : income,
+          value: isNaN(value) ? 0 : value
+        };
+      })
+      .filter(item => item.value > 0)
+      .sort((a, b) => b.value - a.value);
   }, [currentTransactions, donutViewMode]);
 
   const periodDetailsTransactions = useMemo(() => {
