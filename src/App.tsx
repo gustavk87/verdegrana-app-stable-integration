@@ -1440,7 +1440,9 @@ export default function App() {
   }, [activeProfile]);
 
   const allProfiles = useMemo(() => {
-    return [...profilesList].sort((a,b) => a.name.localeCompare(b.name));
+    const unique = new Map<string, ProfileInfo>();
+    profilesList.forEach(p => unique.set(p.name, p));
+    return Array.from(unique.values()).sort((a,b) => a.name.localeCompare(b.name));
   }, [profilesList]);
 
   // --- Handlers ---
@@ -1473,7 +1475,7 @@ export default function App() {
       }
     }
 
-    setProfilesList(prev => prev.map(item => item === p ? cleanNewName : item));
+    setProfilesList(prev => prev.map(item => item.name === p ? { ...item, name: cleanNewName } : item));
     if (activeProfile === p) setActiveProfile(cleanNewName);
     toast.success(`Perfil renomeado para ${cleanNewName}`);
   };
@@ -1526,7 +1528,8 @@ export default function App() {
             await writable.close();
           }
 
-          setProfilesList(prev => [...prev, cleanName]);
+          const newProfile: ProfileInfo = { name: cleanName, source: isCloudMode ? 'cloud' : 'local' };
+          setProfilesList(prev => mergeProfiles(prev, [newProfile]));
           toast.success(`Perfil ${cleanName} importado com sucesso!`);
         } catch (err) {
           toast.error('Arquivo invﾃ｡lido.');
@@ -2294,6 +2297,12 @@ export default function App() {
           setProfilesList(migrated);
         }
       })
+      .on('postgres_changes', {
+        event: '*', schema: 'public', table: 'profiles', filter: `user_id=eq.${user.id}`
+      }, (payload: any) => {
+        console.log('Real-time Channel: Profile Change', payload);
+        syncProfilesFromCloud(user.id);
+      })
       .on('broadcast', { event: 'sync' }, (payload: any) => {
         const senderId = payload?.payload?.userId || payload?.userId;
         const senderClientId = payload?.payload?.clientId || payload?.clientId;
@@ -2545,7 +2554,13 @@ export default function App() {
 
   // Calculations & Filters
   const profileTransactions = useMemo(() => {
-    return transactions.filter(t => (t.profile_name) === activeProfile);
+    const seen = new Set<string>();
+    return transactions.filter(t => {
+      if (t.profile_name !== activeProfile) return false;
+      if (seen.has(t.id)) return false;
+      seen.add(t.id);
+      return true;
+    });
   }, [transactions, activeProfile]);
 
   const currentTransactions = useMemo(() => {
@@ -2620,13 +2635,7 @@ export default function App() {
     const orphans = filtered.filter(t => t.parent_id && !exhibitedIds.has(t.id));
     result.push(...orphans.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()));
 
-    // Deduplicaﾃｧﾃ｣o e retorno
-    const seenIds = new Set();
-    return result.filter(t => {
-      if (seenIds.has(t.id)) return false;
-      seenIds.add(t.id);
-      return true;
-    });
+    return result;
   }, [currentTransactions, searchTerm, categoryFilters, sortConfig, updateSortOrder, valueSortOrder]);
 
   const stats = useMemo(() => {
@@ -3170,25 +3179,26 @@ export default function App() {
                 className="aspect-square bg-white/5 border border-white/10 rounded-[2.5rem] flex flex-col items-center justify-center gap-4 hover:bg-emerald-500/10 hover:border-emerald-500/30 transition-all active:scale-95 group relative overflow-hidden"
               >
                 <div className="absolute top-4 right-4 flex gap-1">
-                   {p.source === 'cloud' && <Cloud className="w-3 h-3 text-slate-500" />}
-                   {p.source === 'local' && <Smartphone className="w-3 h-3 text-slate-500" />}
+                   {p.source === 'cloud' && <Cloud className="w-3 h-3 text-indigo-400" />}
+                   {p.source === 'local' && <Smartphone className="w-3 h-3 text-emerald-500" />}
                    {p.source === 'both' && (
-                     <>
-                       <Cloud className="w-3 h-3 text-emerald-500" />
+                     <div className="flex items-center gap-0.5">
+                       <Cloud className="w-3 h-3 text-indigo-400" />
                        <Smartphone className="w-3 h-3 text-emerald-500" />
-                     </>
+                     </div>
                    )}
                 </div>
 
-                <div className="w-16 h-16 rounded-[1.5rem] bg-emerald-500/10 flex items-center justify-center group-hover:bg-emerald-500 group-hover:text-white transition-all">
+                <div className="w-16 h-16 rounded-[1.5rem] bg-emerald-500/10 flex items-center justify-center group-hover:bg-emerald-500 group-hover:text-white transition-all relative">
+                   {p.source === 'both' && <div className="absolute -top-1 -right-1 w-4 h-4 bg-indigo-500 rounded-full border-2 border-slate-950 flex items-center justify-center text-[8px] font-black"><RefreshCw className="w-2.5 h-2.5 animate-spin-slow" /></div>}
                   <User className="w-8 h-8 text-emerald-500 group-hover:text-white" />
                 </div>
                 <div className="flex flex-col items-center gap-1">
                   <span className="text-xs font-black text-white uppercase tracking-widest">{p.name}</span>
                   <div className="flex gap-2">
-                    {p.source === 'cloud' && <span className="text-[8px] font-bold text-slate-500 uppercase tracking-tighter">Nuvem</span>}
-                    {p.source === 'local' && <span className="text-[8px] font-bold text-slate-500 uppercase tracking-tighter">Local</span>}
-                    {p.source === 'both' && <span className="text-[8px] font-bold text-emerald-500 uppercase tracking-tighter">Sincronizado</span>}
+                    {p.source === 'cloud' && <span className="text-[8px] font-black text-indigo-400 uppercase tracking-widest">Nuvem</span>}
+                    {p.source === 'local' && <span className="text-[8px] font-black text-emerald-500 uppercase tracking-widest">Local</span>}
+                    {p.source === 'both' && <span className="text-[8px] font-black text-emerald-400 uppercase tracking-widest bg-emerald-500/10 px-1.5 rounded-full">Sincronizado</span>}
                   </div>
                 </div>
               </button>
@@ -4248,7 +4258,7 @@ SOLICITAﾃ�ﾃグ: Forneﾃｧa uma anﾃ｡lise crﾃｭtica, insights de economia e recomendaﾃ
                               supabase.from('profiles').insert([{ name: name.trim(), user_id: user.id }]);
                             }
                             
-                            setProfilesList(p => [...p, name.trim()]);
+                            setProfilesList(prev => [...prev, { name: name.trim(), source: isCloudMode ? 'cloud' : 'local' }]);
                             setActiveProfile(name.trim());
                             toast.success(`Perfil "${name}" criado!`);
                           }
@@ -4263,87 +4273,101 @@ SOLICITAﾃ�ﾃグ: Forneﾃｧa uma anﾃ｡lise crﾃｭtica, insights de economia e recomendaﾃ
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                      {allProfiles.map(p => (
                        <div 
-                         key={p}
+                         key={p.name}
                          className={cn(
                            "p-6 rounded-[2rem] border transition-all flex flex-col gap-4 relative group",
-                           activeProfile === p ? "bg-emerald-500/10 border-emerald-500/50" : "bg-white/5 border-white/5 hover:border-white/10"
+                           activeProfile === p.name ? "bg-emerald-500/10 border-emerald-500/50" : "bg-white/5 border-white/5 hover:border-white/10"
                          )}
                        >
                           <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                          <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center", activeProfile === p ? "bg-emerald-500 text-white shadow-lg shadow-emerald-500/30" : "bg-white/5 text-slate-500")}>
-                             <User className="w-5 h-5" />
-                          </div>
-                          <div className="min-w-0">
-                            <p className="text-xs font-black text-white uppercase tracking-[0.2em] truncate max-w-[120px]">{p}</p>
-                            {activeProfile === p ? (
-                              <p className="text-[8px] font-black text-emerald-500 uppercase tracking-widest mt-0.5">Perfil Ativo</p>
-                            ) : (
-                              <p className="text-[8px] font-bold text-slate-600 uppercase mt-0.5">Inativo</p>
-                            )}
-                          </div>
-                        </div>
+                            <div className="flex items-center gap-3">
+                              <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center", activeProfile === p.name ? "bg-emerald-500 text-white shadow-lg shadow-emerald-500/30" : "bg-white/5 text-slate-500")}>
+                                <User className="w-5 h-5" />
+                              </div>
+                              <div className="min-w-0">
+                                <p className="text-xs font-black text-white uppercase tracking-[0.2em] truncate max-w-[120px]">{p.name}</p>
+                                <div className="flex items-center gap-2 mt-0.5">
+                                    <span className={cn(
+                                        "px-1.5 py-0.5 rounded text-[7px] font-black uppercase tracking-tighter border",
+                                        p.source === 'cloud' ? "bg-indigo-500/10 text-indigo-400 border-indigo-500/20" : 
+                                        p.source === 'both' ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20" :
+                                        "bg-emerald-500/10 text-emerald-500 border-emerald-500/20"
+                                    )}>
+                                        {p.source === 'cloud' ? 'Nuvem' : p.source === 'both' ? 'Sinc' : 'Local'}
+                                    </span>
+                                    {activeProfile === p.name ? (
+                                      <p className="text-[8px] font-black text-emerald-500 uppercase tracking-widest">Ativo</p>
+                                    ) : (
+                                      <p className="text-[8px] font-bold text-slate-600 uppercase italic">Inativo</p>
+                                    )}
+                                </div>
+                              </div>
+                            </div>
                              
-                             <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                              <button 
+                                onClick={() => handleRenameProfile(p.name)}
+                                className="p-2 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400"
+                              >
+                                <Edit2 className="w-4 h-4" />
+                              </button>
+                              {profilesList.length > 1 && (
                                 <button 
-                                  onClick={() => handleRenameProfile(p)}
-                                  className="p-2 bg-white/5 hover:bg-white/10 rounded-lg text-slate-400"
-                                >
-                                  <Edit2 className="w-4 h-4" />
-                                </button>
-                                {profilesList.length > 1 && (
-                                  <button 
-                                    onClick={async () => {
-                                      if (confirm(`Excluir o perfil "${p}"? Todos os dados vinculados serﾃ｣o inacessﾃｭveis.`)) {
-                                        if (isCloudMode && user && supabase) {
-                                          await supabase.from('profiles').delete().eq('user_id', user.id).eq('name', p);
-                                          await supabase.from('transactions').delete().eq('user_id', user.id).eq('profile_name', p);
-                                        } else if (folderHandle) {
-                                          try { await folderHandle.removeEntry(`${p}.json`); } catch(e) {}
-                                        }
-                                        
-                                        const newList = profilesList.filter(item => item !== p);
-                                        setProfilesList(newList);
+                                  onClick={async () => {
+                                    if (confirm(`Excluir o perfil "${p.name}"? Todos os dados vinculados serﾃ｣o inacessﾃｭveis.`)) {
+                                      if (isCloudMode && user && supabase) {
+                                        await supabase.from('profiles').delete().eq('user_id', user.id).eq('name', p.name);
+                                        await supabase.from('transactions').delete().eq('user_id', user.id).eq('profile_name', p.name);
+                                      } else if (folderHandle) {
+                                        try { await folderHandle.removeEntry(`${p.name}.json`); } catch(e) {}
+                                      }
+                                      
+                                      const newList = profilesList.filter(item => item.name !== p.name);
+                                      setProfilesList(newList);
 
-                                        // Ensure transactions are also cleared from state
-                                        setTransactions(prev => {
-                                          const next = prev.filter(t => t.profile_name !== p);
-                                          pushToHistory(next);
-                                          return next;
-                                        });
+                                      setTransactions(prev => {
+                                        const next = prev.filter(t => t.profile_name !== p.name);
+                                        pushToHistory(next);
+                                        return next;
+                                      });
 
-                                        if (activeProfile === p) {
-                                           const next = newList[0] || '';
-                                           setActiveProfile(next);
-                                           if (next) await loadProfileData(next);
-                                           else {
-                                             setTransactions([]);
-                                             setBootStage('welcome');
-                                           }
+                                      if (activeProfile === p.name) {
+                                        const next = newList[0]?.name || '';
+                                        setActiveProfile(next);
+                                        if (next) await loadProfileData(next);
+                                        else {
+                                          setTransactions([]);
+                                          setBootStage('welcome');
                                         }
                                       }
-                                    }}
-                                    className="p-2 bg-rose-500/10 hover:bg-rose-500/20 rounded-lg text-rose-500"
-                                  >
-                                    <Trash2 className="w-4 h-4" />
-                                  </button>
-                                )}
-                             </div>
+                                    }
+                                  }}
+                                  className="p-2 bg-rose-500/10 hover:bg-rose-500/20 rounded-lg text-rose-500"
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
+                              )}
+                            </div>
                           </div>
 
                           <div className="flex items-center gap-2 mt-2">
-                             <button
-                               onClick={() => {
-                                 setActiveProfile(p);
-                                 toast.success(`Perfil ${p} selecionado.`);
-                               }}
-                               className={cn(
-                                 "flex-1 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest transition-all",
-                                 activeProfile === p ? "bg-emerald-500 text-white shadow-lg shadow-emerald-500/20" : "bg-white/5 text-slate-500 hover:bg-white/10"
-                               )}
-                             >
-                                Selecionar
-                             </button>
+                            <button
+                              onClick={() => {
+                                if (p.source === 'cloud' && !folderHandle && !isDemoMode) {
+                                  setRescueProfile(p);
+                                  return;
+                                }
+                                setActiveProfile(p.name);
+                                loadProfileData(p.name);
+                                toast.success(`Perfil ${p.name} selecionado.`);
+                              }}
+                              className={cn(
+                                "flex-1 py-3 rounded-xl font-black text-[10px] uppercase tracking-widest transition-all",
+                                activeProfile === p.name ? "bg-emerald-500 text-white shadow-lg shadow-emerald-500/20" : "bg-white/5 text-slate-500 hover:bg-white/10"
+                              )}
+                            >
+                              Selecionar
+                            </button>
                           </div>
                        </div>
                      ))}
@@ -4527,7 +4551,7 @@ SOLICITAﾃ�ﾃグ: Forneﾃｧa uma anﾃ｡lise crﾃｭtica, insights de economia e recomendaﾃ
                               // Recursively delete all profile files
                               for (const p of profilesList) {
                                 try {
-                                  await folderHandle.removeEntry(`${p}.json`);
+                                  await folderHandle.removeEntry(`${p.name}.json`);
                                 } catch (e) {
                                   // Fallback for files not in list but in folder
                                 }
@@ -5129,6 +5153,67 @@ SOLICITAﾃ�ﾃグ: Forneﾃｧa uma anﾃ｡lise crﾃｭtica, insights de economia e recomendaﾃ
                         </button>
                       ))}
                  </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
+          {rescueProfile && (
+            <div className="fixed inset-0 z-[400] flex items-center justify-center p-6">
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setRescueProfile(null)} className="absolute inset-0 bg-slate-950/90 backdrop-blur-xl" />
+              <motion.div initial={{ scale: 0.9, opacity: 0, y: 20 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.9, opacity: 0, y: 20 }} className="relative glass max-w-md w-full p-10 rounded-[3rem] border border-emerald-500/20 shadow-2xl text-center space-y-8">
+                <div className="w-20 h-20 bg-emerald-500/10 rounded-3xl flex items-center justify-center text-emerald-500 mx-auto">
+                  <CloudDownload className="w-10 h-10" />
+                </div>
+                <div className="space-y-3">
+                  <h2 className="text-3xl font-black text-white uppercase tracking-tighter italic">Resgate de Perfil</h2>
+                  <p className="text-slate-400 text-sm leading-relaxed">
+                    Este perfil estﾃ｡ na nuvem, mas vocﾃｪ ainda nﾃ｣o vinculou uma pasta local neste dispositivo. Para continuar, escolha onde os arquivos serﾃ｣o salvos.
+                  </p>
+                </div>
+                
+                <div className="space-y-4">
+                  <button 
+                    onClick={async () => {
+                      try {
+                        // @ts-ignore
+                        const handle = await window.showDirectoryPicker();
+                        setFolderHandle(handle);
+                        
+                        // Download the transactions for this specific profile
+                        if (!supabase || !user) return;
+                        setSyncStatus('saving');
+                        const { data } = await supabase.from('transactions').select('*').eq('user_id', user.id).eq('profile_name', rescueProfile.name);
+                        
+                        if (data) {
+                          const mapped = data.map(mapCloudTxToLocal);
+                          const fileHandle = await handle.getFileHandle(`${rescueProfile.name}.json`, { create: true });
+                          const writable = await fileHandle.createWritable();
+                          await writable.write(JSON.stringify({ transactions: mapped, categories }, null, 2));
+                          await writable.close();
+                          
+                          setTransactions(prev => {
+                            const others = prev.filter(t => t.profile_name !== rescueProfile.name);
+                            return [...others, ...mapped];
+                          });
+                          
+                          setActiveProfile(rescueProfile.name);
+                          toast.success(`Perfil ${rescueProfile.name} resgatado com sucesso!`);
+                        }
+                        setRescueProfile(null);
+                        setSyncStatus('synced');
+                      } catch (e) {
+                         console.error(e);
+                         toast.error("Processo cancelado ou erro ao salvar.");
+                      }
+                    }}
+                    className="w-full py-5 bg-emerald-500 rounded-2xl text-white font-black uppercase text-xs tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all flex items-center justify-center gap-3"
+                  >
+                    <FolderSync className="w-5 h-5" /> Escolher Pasta de Destino
+                  </button>
+                  <button onClick={() => setRescueProfile(null)} className="text-[10px] font-black text-slate-500 uppercase tracking-widest hover:text-white transition-colors">Voltar</button>
+                </div>
               </motion.div>
             </div>
           )}
