@@ -132,6 +132,12 @@ const formatCurrency = (value: number) => {
 // --- Types ---
 type TransactionType = 'entrada' | 'saída';
 type TransactionStatus = 'realizado' | 'pendente';
+type ProfileSource = 'cloud' | 'local' | 'both';
+
+interface ProfileInfo {
+  name: string;
+  source: ProfileSource;
+}
 
 interface Transaction {
   id: string;
@@ -1001,10 +1007,14 @@ export default function App() {
   }, [isAddModalOpen, editingTransaction]);
 
   // Persistent Profiles List
-  const [profilesList, setProfilesList] = useState<string[]>(() => {
+  const [profilesList, setProfilesList] = useState<ProfileInfo[]>(() => {
     const saved = localStorage.getItem('verdegrana_profiles_list');
     const initial = saved ? JSON.parse(saved) : [];
-    return Array.from(new Set(initial));
+    // Migration: Handle both old string array and new object array
+    return (initial as any[]).map(p => {
+      if (typeof p === 'string') return { name: p, source: 'local' as const };
+      return p as ProfileInfo;
+    });
   });
 
   const [uiScale, setUiScale] = useState<number>(() => {
@@ -1028,9 +1038,12 @@ export default function App() {
   const [wipeConfirmText, setWipeConfirmText] = useState('');
 
   // Folder Sync Logic
+  const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+
   const downloadCloudToFolder = async (userId: string, handle: any) => {
     if (!supabase || !handle) return;
     setBootStage('sync_initial');
+    const startTime = Date.now();
     try {
       // 1. Get all profiles from cloud
       const { data: profiles, error: pError } = await supabase.from('profiles').select('name').eq('user_id', userId);
@@ -1050,13 +1063,22 @@ export default function App() {
       for (const name of profileNames) {
         const profileTxs = txs.filter((t: any) => t.profile_name === name).map(mapCloudTxToLocal);
         const fileHandle = await handle.getFileHandle(`${name}.json`, { create: true });
-        const writable = await fileHandle.createWritable();
+        const writable = await fileHandle.createWritable({ keepExistingData: false });
         await writable.write(JSON.stringify({ transactions: profileTxs, categories }, null, 2));
         await writable.close();
       }
 
-      setProfilesList(profileNames);
-      toast.success('Sincronização inicial concluída: Nuvem -> Pasta Local');
+      // Merge with existing list
+      setProfilesList(prev => {
+        const cloudProfiles: ProfileInfo[] = profileNames.map(name => ({ name, source: 'cloud' as const }));
+        return mergeProfiles(prev, cloudProfiles);
+      });
+
+      // Ensure minimum delay for visual stability
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 800) await delay(800 - elapsed);
+      
+      toast.success('Sincronização concluída: Nuvem -> Pasta Local');
     } catch (e) {
       console.error("Erro no download inicial cloud -> folder:", e);
       toast.error('Erro ao sincronizar dados da nuvem para a pasta local.');
@@ -1064,26 +1086,21 @@ export default function App() {
   };
 
   const syncProfilesFromFolder = async (handle: any) => {
-    const profiles: string[] = [];
+    const profileNames: string[] = [];
     try {
       // @ts-ignore
       for await (const entry of handle.values()) {
         if (entry.kind === 'file' && entry.name.endsWith('.json')) {
-          profiles.push(entry.name.replace('.json', ''));
+          profileNames.push(entry.name.replace('.json', ''));
         }
       }
     } catch (e) {
       console.error("Erro ao escanear pasta:", e);
     }
-    // Filter for uniqueness
-    const finalProfiles = Array.from(new Set(profiles));
-    if (finalProfiles.length === 0) {
-      // If zero profiles exist, we should trigger onboarding
-      setProfilesList([]);
-      return [];
-    }
-    setProfilesList(finalProfiles);
-    return finalProfiles;
+    
+    const localProfiles: ProfileInfo[] = profileNames.map(name => ({ name, source: 'local' as const }));
+    setProfilesList(prev => mergeProfiles(prev, localProfiles));
+    return localProfiles;
   };
 
   const syncProfilesFromCloud = async (userId: string) => {
@@ -1092,15 +1109,33 @@ export default function App() {
       const { data, error } = await supabase.from('profiles').select('name').eq('user_id', userId);
       if (error) throw error;
       
-      // UNIQUE PROFILE DEDUPLICATION
-      const profiles = Array.from(new Set(data.map((p: any) => p.name)));
+      const profileNames = Array.from(new Set(data.map((p: any) => p.name))) as string[];
+      const cloudProfiles: ProfileInfo[] = profileNames.map(name => ({ name, source: 'cloud' as const }));
       
-      setProfilesList(profiles);
-      return profiles;
+      setProfilesList(prev => mergeProfiles(prev, cloudProfiles));
+      return cloudProfiles;
     } catch (e) {
       console.error("Erro ao sincronizar perfis cloud:", e);
       return [];
     }
+  };
+
+  const mergeProfiles = (current: ProfileInfo[], incoming: ProfileInfo[]): ProfileInfo[] => {
+    const map = new Map<string, ProfileInfo>();
+    current.forEach(p => map.set(p.name, p));
+    
+    incoming.forEach(inc => {
+      const existing = map.get(inc.name);
+      if (existing) {
+        if (existing.source !== inc.source) {
+          map.set(inc.name, { name: inc.name, source: 'both' });
+        }
+      } else {
+        map.set(inc.name, inc);
+      }
+    });
+    
+    return Array.from(map.values());
   };
 
   const loadProfileData = async (profileName: string) => {
@@ -1137,11 +1172,14 @@ export default function App() {
   };
 
   const saveToFolder = async (profileName: string, txs: Transaction[], cats: Category[]) => {
-    if (!folderHandle) return;
+    if (!folderHandle || !profileName) return;
     try {
       const fileHandle = await folderHandle.getFileHandle(`${profileName}.json`, { create: true });
-      const writable = await fileHandle.createWritable();
-      const content = JSON.stringify({ transactions: txs, categories: cats }, null, 2);
+      const writable = await fileHandle.createWritable({ keepExistingData: false });
+      const content = JSON.stringify({ 
+        transactions: txs.filter(t => t.profile_name === profileName), 
+        categories: cats 
+      }, null, 2);
       await writable.write(content);
       await writable.close();
       setSyncStatus('synced');
@@ -1379,6 +1417,7 @@ export default function App() {
           toast.success('BEM-VINDO DE VOLTA!');
           setIsTrial(false);
           const profiles = await syncProfilesFromCloud(data.user.id);
+          await delay(800);
           // ONBOARDING GATEWAY
           if (!profiles || profiles.length === 0) {
             setBootStage('welcome'); // Overlay to create first profile
@@ -1399,13 +1438,13 @@ export default function App() {
   }, [activeProfile]);
 
   const allProfiles = useMemo(() => {
-    return Array.from(new Set(profilesList)).sort();
+    return [...profilesList].sort((a,b) => a.name.localeCompare(b.name));
   }, [profilesList]);
 
   // --- Handlers ---
   const handleRenameProfile = async (p: string) => {
     const newName = prompt(`Novo nome para o perfil "${p}":`, p);
-    if (!newName || newName.trim() === p || profilesList.includes(newName.trim())) {
+    if (!newName || newName.trim() === p || profilesList.some(item => item.name === newName.trim())) {
       if (newName && newName.trim() !== p) toast.error('Nome inválido ou já existente.');
       return;
     }
@@ -1452,7 +1491,7 @@ export default function App() {
           const name = prompt('Dê um nome para este perfil importado:');
           if (!name) return;
           const cleanName = name.trim();
-          if (profilesList.includes(cleanName)) {
+          if (profilesList.some(p => p.name === cleanName)) {
             toast.error('Este perfil já existe.');
             return;
           }
@@ -2029,8 +2068,9 @@ export default function App() {
   // --- Initial Boot & Persistence ---
   useEffect(() => {
     const boot = async () => {
+      const startTime = Date.now();
       try {
-        // Recovery logic: if localStorage is full, clear logs to make room for session
+        // Recovery logic...
         try {
           const testKey = 'verdegrana_test_quota';
           localStorage.setItem(testKey, '1');
@@ -2038,11 +2078,15 @@ export default function App() {
         } catch (e) {
           console.warn("LocalStorage issue detected during boot. Purging logs for recovery.");
           localStorage.removeItem('verdegrana_audit_trail');
-          // No reload here, let it continue to boot
         }
 
         const db = await initDB();
         const persisted = await getState(db);
+
+        const ensureDelay = async () => {
+          const elapsed = Date.now() - startTime;
+          if (elapsed < 800) await delay(800 - elapsed);
+        };
 
         // 1. Check for Cloud Session
         if (supabase) {
@@ -2052,9 +2096,11 @@ export default function App() {
             setIsCloudMode(true);
             
             if (!folderHandle) {
+              await ensureDelay();
               setBootStage('folder_setup');
             } else {
               const profiles = await syncProfilesFromCloud(session.user.id);
+              await ensureDelay();
               if (!profiles || profiles.length === 0) setBootStage('welcome');
               else setBootStage('profile_select');
             }
@@ -2069,11 +2115,10 @@ export default function App() {
             if (permission === 'granted') {
               setFolderHandle(persisted.workspaceHandle);
               await syncProfilesFromFolder(persisted.workspaceHandle);
+              await ensureDelay();
               setBootStage('profile_select');
               return;
             } else {
-              // Permission lost or needs re-grant (standard web safety)
-              // We'll keep it in state but boot to auth for fresh start
               toast.info('Seus arquivos locais estão bloqueados. Conecte a pasta novamente nas configurações.');
             }
           } catch (e) {
@@ -2083,11 +2128,19 @@ export default function App() {
 
         // 3. Hydrate categories and profiles from local (fallback)
         if (persisted?.categories) setCategories(persisted.categories);
-        if (persisted?.profiles_list) setProfilesList(persisted.profiles_list);
+        if (persisted?.profiles_list) {
+          // Migration from string to object if needed
+          const migrated = (persisted.profiles_list as any[]).map(p => 
+            typeof p === 'string' ? { name: p, source: 'local' as const } : p
+          );
+          setProfilesList(migrated);
+        }
 
+        await ensureDelay();
         setBootStage('splash');
       } catch (e) {
         console.error("Erro no boot:", e);
+        await delay(800);
         setBootStage('splash');
       }
     };
@@ -2136,11 +2189,18 @@ export default function App() {
   });
 
   // Module 3: Real-time Sync - Channels
+  const channelRef = useRef<any>(null);
+
   useEffect(() => {
     if (!supabase || !isCloudMode || !user) return;
 
     // Unified Real-time Channel (Transactions, Audit Logs, Metadata, Broadcasts)
-    const channel = supabase.channel(`verdegrana_all_${user.id}`)
+    const channel = supabase.channel(`verdegrana_all_${user.id}`, {
+      config: {
+        broadcast: { self: false },
+        presence: { key: user.id }
+      }
+    })
       .on('postgres_changes', { 
         event: 'INSERT', schema: 'public', table: 'transactions', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
@@ -2151,11 +2211,9 @@ export default function App() {
           const next = [...prev, newTx];
           safeSave('verdegrana_data', next);
           
-          // Hybrid: Auto-save to active profile folder file
-          if (folderHandle && newTx.profile_name === activeProfile) {
-            saveToFolder(activeProfile, next.filter(t => t.profile_name === activeProfile), categories);
+          if (folderHandle && newTx.profile_name) {
+            saveToFolder(newTx.profile_name, next, categories);
           }
-          
           return next;
         });
         toast.info(`⚡ Novo lançamento: ${newTx.desc}`, { duration: 2000 });
@@ -2169,11 +2227,9 @@ export default function App() {
           const next = prev.map(t => t.id === updatedTx.id ? updatedTx : t);
           safeSave('verdegrana_data', next);
           
-          // Hybrid: Auto-save to folder
-          if (folderHandle && updatedTx.profile_name === activeProfile) {
-             saveToFolder(activeProfile, next.filter(t => t.profile_name === activeProfile), categories);
+          if (folderHandle && updatedTx.profile_name) {
+             saveToFolder(updatedTx.profile_name, next, categories);
           }
-          
           return next;
         });
       })
@@ -2183,14 +2239,14 @@ export default function App() {
         console.log('Real-time Channel: Transaction DELETE', payload);
         const deletedId = payload.old.id;
         setTransactions(prev => {
+          const deletedTx = prev.find(t => t.id === deletedId);
+          const deletedTxProfile = deletedTx?.profile_name;
           const next = prev.filter(t => t.id !== deletedId);
           localStorage.setItem('verdegrana_data', JSON.stringify(next));
           
-          // Hybrid: Auto-save to folder
-          if (folderHandle) {
-             saveToFolder(activeProfile, next.filter(t => t.profile_name === activeProfile), categories);
+          if (folderHandle && deletedTxProfile) {
+             saveToFolder(deletedTxProfile, next, categories);
           }
-          
           return next;
         });
       })
@@ -2226,12 +2282,10 @@ export default function App() {
           localStorage.setItem('verdegrana_categories', JSON.stringify(newData.categories));
         }
         if (newData?.profilesList) {
-          setProfilesList(newData.profilesList);
-          localStorage.setItem('verdegrana_profiles', JSON.stringify(newData.profilesList));
-        }
-        if (newData?.auditLogs) {
-          setAuditLogs(newData.auditLogs);
-          localStorage.setItem('verdegrana_audit_trail', JSON.stringify(newData.auditLogs));
+          const migrated = (newData.profilesList as any[]).map(p => 
+            typeof p === 'string' ? { name: p, source: 'cloud' as const } : p
+          );
+          setProfilesList(migrated);
         }
       })
       .on('broadcast', { event: 'sync' }, (payload: any) => {
@@ -2240,24 +2294,26 @@ export default function App() {
         
         if (senderId === user.id && senderClientId !== clientId) {
           console.log('Real-time Channel: SYNC Broadcast Received', payload);
-          if (payload?.payload?.type === 'full_reset' || payload?.type === 'full_reset') {
-            localStorage.clear();
-            window.location.reload();
-            return;
-          }
-          // Refresh background data
-          setTimeout(() => fetchCloudData(user.id), 1500);
+          // When someone else syncs, we force a fetch to be sure
+          setTimeout(() => fetchCloudData(user.id), 500);
         }
       })
-      .subscribe((status: string) => {
+      .subscribe(async (status: string) => {
         console.log(`Real-time Channel Status (${user.id}):`, status);
-        if (status === 'CHANNEL_ERROR') {
+        if (status === 'SUBSCRIBED') {
+          console.log("WebSocket connected and listening for changes...");
+        }
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          console.warn("WebSocket connection issue. Retrying data fetch.");
           setTimeout(() => fetchCloudData(user.id), 2000);
         }
       });
 
+    channelRef.current = channel;
+
     return () => {
       supabase.removeChannel(channel);
+      channelRef.current = null;
     };
   }, [isCloudMode, user, supabase]);
 
@@ -3094,19 +3150,37 @@ export default function App() {
           <div className="grid grid-cols-2 gap-4 max-h-[350px] overflow-y-auto pr-2 custom-scrollbar">
             {allProfiles.map(p => (
               <button
-                key={p}
+                key={p.name}
                 onClick={async () => {
-                  setActiveProfile(p);
-                  await loadProfileData(p);
+                  setActiveProfile(p.name);
+                  await loadProfileData(p.name);
                   setBootStage('ready');
-                  toast.success(`Bem-vindo, ${p}!`);
+                  toast.success(`Bem-vindo, ${p.name}!`);
                 }}
-                className="aspect-square bg-white/5 border border-white/10 rounded-[2.5rem] flex flex-col items-center justify-center gap-4 hover:bg-emerald-500/10 hover:border-emerald-500/30 transition-all active:scale-95 group"
+                className="aspect-square bg-white/5 border border-white/10 rounded-[2.5rem] flex flex-col items-center justify-center gap-4 hover:bg-emerald-500/10 hover:border-emerald-500/30 transition-all active:scale-95 group relative overflow-hidden"
               >
+                <div className="absolute top-4 right-4 flex gap-1">
+                   {p.source === 'cloud' && <Cloud className="w-3 h-3 text-slate-500" />}
+                   {p.source === 'local' && <Smartphone className="w-3 h-3 text-slate-500" />}
+                   {p.source === 'both' && (
+                     <>
+                       <Cloud className="w-3 h-3 text-emerald-500" />
+                       <Smartphone className="w-3 h-3 text-emerald-500" />
+                     </>
+                   )}
+                </div>
+
                 <div className="w-16 h-16 rounded-[1.5rem] bg-emerald-500/10 flex items-center justify-center group-hover:bg-emerald-500 group-hover:text-white transition-all">
                   <User className="w-8 h-8 text-emerald-500 group-hover:text-white" />
                 </div>
-                <span className="text-xs font-black text-white uppercase tracking-widest">{p}</span>
+                <div className="flex flex-col items-center gap-1">
+                  <span className="text-xs font-black text-white uppercase tracking-widest">{p.name}</span>
+                  <div className="flex gap-2">
+                    {p.source === 'cloud' && <span className="text-[8px] font-bold text-slate-500 uppercase tracking-tighter">Nuvem</span>}
+                    {p.source === 'local' && <span className="text-[8px] font-bold text-slate-500 uppercase tracking-tighter">Local</span>}
+                    {p.source === 'both' && <span className="text-[8px] font-bold text-emerald-500 uppercase tracking-tighter">Sincronizado</span>}
+                  </div>
+                </div>
               </button>
             ))}
             
@@ -3115,7 +3189,7 @@ export default function App() {
                 const name = prompt('Nome do novo perfil:');
                 if (name) {
                   const cleanName = name.trim();
-                  if (profilesList.includes(cleanName)) {
+                  if (profilesList.some(p => p.name === cleanName)) {
                     toast.error('Este perfil já existe.');
                     return;
                   }
@@ -3124,7 +3198,7 @@ export default function App() {
                     await supabase.from('profiles').insert([{ name: cleanName, user_id: user.id }]);
                   }
                   
-                  setProfilesList(prev => [...prev, cleanName]);
+                  setProfilesList(prev => [...prev, { name: cleanName, source: isCloudMode ? 'cloud' : 'local' }]);
                   setActiveProfile(cleanName);
                   setTransactions([]); // New profile starts empty
                   setBootStage('ready');
@@ -3207,7 +3281,7 @@ export default function App() {
                     await writable.close();
                   }
 
-                  setProfilesList([name]);
+                  setProfilesList([{ name, source: isCloudMode ? 'cloud' : 'local' }]);
                   setActiveProfile(name);
                   setTransactions([]);
                   setBootStage('ready');
@@ -4099,7 +4173,7 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                         onClick={() => {
                           const name = prompt('Nome do novo perfil:');
                           if (name && name.trim()) {
-                            if (profilesList.includes(name.trim())) {
+                            if (profilesList.some(p => p.name === name.trim())) {
                               toast.error('Este perfil já existe.');
                               return;
                             }
