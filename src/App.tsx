@@ -40,6 +40,7 @@ import {
   Redo2,
   ShieldCheck,
   Cloud,
+  CloudDownload,
   Play,
   Lock,
   ArrowDownUp,
@@ -700,6 +701,7 @@ type BootStage = 'splash' | 'presentation' | 'auth' | 'folder_setup' | 'sync_ini
 export default function App() {
   const isFileSystemApiSupported = typeof window !== 'undefined' && !!(window as any).showDirectoryPicker;
   const [bootStage, setBootStage] = useState<BootStage>('splash');
+  const [rescueProfile, setRescueProfile] = useState<ProfileInfo | null>(null);
   const [user, setUser] = useState<any>(null);
   const [isCloudMode, setIsCloudMode] = useState(false);
   const [isAuthLoading, setIsAuthLoading] = useState(false);
@@ -1806,12 +1808,16 @@ export default function App() {
       
       if (userMeta?.data?.categories) {
         const cloudCats = userMeta.data.categories;
-        setCategories(cloudCats);
-        localStorage.setItem('verdegrana_categories', JSON.stringify(cloudCats));
+        const catMap = new Map<string, Category>();
+        cloudCats.forEach((c: Category) => catMap.set(c.id, c));
+        const uniqueCats = Array.from(catMap.values());
+        setCategories(uniqueCats);
+        localStorage.setItem('verdegrana_categories', JSON.stringify(uniqueCats));
       }
       
       if (userMeta?.data?.profilesList) {
-        setProfilesList(Array.from(new Set(userMeta.data.profilesList)));
+        const cloudProfiles: ProfileInfo[] = (userMeta.data.profilesList as string[]).map(name => ({ name, source: 'cloud' as const }));
+        setProfilesList(prev => mergeProfiles(prev, cloudProfiles));
       }
 
       // Load Transactions from transactions table
@@ -3152,6 +3158,10 @@ export default function App() {
               <button
                 key={p.name}
                 onClick={async () => {
+                  if (p.source === 'cloud') {
+                    setRescueProfile(p);
+                    return;
+                  }
                   setActiveProfile(p.name);
                   await loadProfileData(p.name);
                   setBootStage('ready');
@@ -3223,6 +3233,62 @@ export default function App() {
              </button>
           </div>
         </motion.div>
+
+        {rescueProfile && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-slate-950/80 backdrop-blur-md">
+             <motion.div 
+               initial={{ opacity: 0, scale: 0.9, y: 20 }}
+               animate={{ opacity: 1, scale: 1, y: 0 }}
+               className="max-w-md w-full glass p-10 rounded-[3rem] border border-white/10 space-y-8 shadow-2xl text-center"
+             >
+                <div className="w-20 h-20 bg-emerald-500/10 rounded-[2rem] flex items-center justify-center mx-auto text-emerald-500">
+                   <CloudDownload className="w-10 h-10" />
+                </div>
+                <div className="space-y-2">
+                   <h3 className="text-2xl font-black text-white uppercase tracking-tighter">Resgatar Perfil</h3>
+                   <p className="text-slate-400 text-sm leading-relaxed">
+                     Encontramos o perfil <span className="text-emerald-400 font-bold">"{rescueProfile.name}"</span> na nuvem! Deseja baixá-lo e sincronizá-lo com este dispositivo?
+                   </p>
+                </div>
+                
+                <div className="space-y-4">
+                   <button 
+                     onClick={async () => {
+                       try {
+                         let handle = folderHandle;
+                         if (!handle) {
+                           // @ts-ignore
+                           handle = await window.showDirectoryPicker();
+                           setFolderHandle(handle);
+                         }
+                         
+                         const loadingId = toast.loading('Baixando dados da nuvem...');
+                         await downloadCloudToFolder(user?.id, handle);
+                         
+                         setActiveProfile(rescueProfile.name);
+                         await loadProfileData(rescueProfile.name);
+                         setBootStage('ready');
+                         setRescueProfile(null);
+                         toast.success('Perfil resgatado com sucesso!', { id: loadingId });
+                       } catch (e: any) {
+                         if (e.name === 'AbortError') return;
+                         toast.error("Falha no resgate: " + e.message);
+                       }
+                     }}
+                     className="w-full py-6 bg-emerald-500 rounded-2xl font-black text-white text-sm uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all"
+                   >
+                     {!folderHandle ? 'ESCOLHER PASTA DE DESTINO' : 'BAIXAR PARA PASTA ATUAL'}
+                   </button>
+                   <button 
+                     onClick={() => setRescueProfile(null)}
+                     className="text-[10px] text-slate-600 font-black uppercase tracking-widest hover:text-slate-400"
+                   >
+                     CANCELAR
+                   </button>
+                </div>
+             </motion.div>
+          </div>
+        )}
       </div>
     );
   }
