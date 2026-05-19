@@ -51,7 +51,8 @@ import {
   ArrowDownNarrowWide,
   History,
   Coins,
-  CornerDownRight
+  CornerDownRight,
+  AlertTriangle
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
@@ -688,9 +689,10 @@ const CategoryDonutSection = ({
   }
 };
 
-type BootStage = 'splash' | 'presentation' | 'auth' | 'welcome' | 'profile_select' | 'ready' | 'syncing';
+type BootStage = 'splash' | 'presentation' | 'auth' | 'folder_setup' | 'sync_initial' | 'welcome' | 'profile_select' | 'ready' | 'syncing';
 
 export default function App() {
+  const isFileSystemApiSupported = typeof window !== 'undefined' && !!(window as any).showDirectoryPicker;
   const [bootStage, setBootStage] = useState<BootStage>('splash');
   const [user, setUser] = useState<any>(null);
   const [isCloudMode, setIsCloudMode] = useState(false);
@@ -703,7 +705,7 @@ export default function App() {
   const [isTrial, setIsTrial] = useState(false);
   const [activeTab, setActiveTab] = useState<Tab>('reports');
   const [activeProfile, setActiveProfile] = useState<string>(() => {
-    return localStorage.getItem('verdegrana_active_profile') || 'Principal';
+    return localStorage.getItem('verdegrana_active_profile') || '';
   });
   const [viewMode, setViewMode] = useState<'tudo' | 'receitas' | 'despesas' | 'personalizado'>('tudo');
   const [confirmModal, setConfirmModal] = useState<{
@@ -739,11 +741,17 @@ export default function App() {
       if (!saved) return [];
       const parsed = JSON.parse(saved);
       if (!Array.isArray(parsed)) return [];
-      return parsed.map((t: any) => ({
-        ...t,
-        status: t.status || 'realizado',
-        is_redutora: t.is_redutora || false
-      }));
+      
+      const txMap = new Map<string, Transaction>();
+      parsed.forEach((t: any) => {
+        if (!t.id) return;
+        txMap.set(t.id, {
+          ...t,
+          status: t.status || 'realizado',
+          is_redutora: t.is_redutora || false
+        });
+      });
+      return Array.from(txMap.values());
     } catch {
       return [];
     }
@@ -754,7 +762,14 @@ export default function App() {
       const saved = localStorage.getItem('verdegrana_audit_trail');
       if (!saved) return [];
       const parsed = JSON.parse(saved);
-      return Array.isArray(parsed) ? parsed.slice(0, 500) : [];
+      if (!Array.isArray(parsed)) return [];
+      
+      const logMap = new Map<string, AuditLog>();
+      parsed.forEach((l: any) => {
+        if (!l.id) return;
+        logMap.set(l.id, l);
+      });
+      return Array.from(logMap.values()).slice(0, 500);
     } catch {
       return [];
     }
@@ -1013,6 +1028,41 @@ export default function App() {
   const [wipeConfirmText, setWipeConfirmText] = useState('');
 
   // Folder Sync Logic
+  const downloadCloudToFolder = async (userId: string, handle: any) => {
+    if (!supabase || !handle) return;
+    setBootStage('sync_initial');
+    try {
+      // 1. Get all profiles from cloud
+      const { data: profiles, error: pError } = await supabase.from('profiles').select('name').eq('user_id', userId);
+      if (pError) throw pError;
+
+      const profileNames = Array.from(new Set(profiles.map((p: any) => p.name))) as string[];
+      
+      // 2. Download all transactions
+      const { data: txs, error: txError } = await supabase.from('transactions').select('*').eq('user_id', userId);
+      if (txError) throw txError;
+
+      // 3. Download metadata
+      const { data: userMeta } = await supabase.from('userdata').select('data').eq('user_id', userId).single();
+      const categories = userMeta?.data?.categories || DEFAULT_CATEGORIES.map(c => ({ id: c.toLowerCase(), name: c }));
+
+      // 4. Save each profile to its own file in the folder
+      for (const name of profileNames) {
+        const profileTxs = txs.filter((t: any) => t.profile_name === name).map(mapCloudTxToLocal);
+        const fileHandle = await handle.getFileHandle(`${name}.json`, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(JSON.stringify({ transactions: profileTxs, categories }, null, 2));
+        await writable.close();
+      }
+
+      setProfilesList(profileNames);
+      toast.success('Sincronização inicial concluída: Nuvem -> Pasta Local');
+    } catch (e) {
+      console.error("Erro no download inicial cloud -> folder:", e);
+      toast.error('Erro ao sincronizar dados da nuvem para a pasta local.');
+    }
+  };
+
   const syncProfilesFromFolder = async (handle: any) => {
     const profiles: string[] = [];
     try {
@@ -1599,6 +1649,7 @@ export default function App() {
     };
     
     setTransactions(prev => {
+      if (prev.some(t => t.id === newId)) return prev;
       const next = [...prev, newTx];
       pushToHistory(next);
       return next;
@@ -1721,7 +1772,7 @@ export default function App() {
       }
       
       if (userMeta?.data?.profilesList) {
-        setProfilesList(userMeta.data.profilesList);
+        setProfilesList(Array.from(new Set(userMeta.data.profilesList)));
       }
 
       // Load Transactions from transactions table
@@ -1754,21 +1805,22 @@ export default function App() {
       }
       
       setAuditLogs(prev => {
-        const combined = [...mappedLogs];
-        const now = new Date().getTime();
+        // Use a Map for guaranteed unique IDs
+        const logMap = new Map<string, AuditLog>();
         
-        // Merge strategy: Keep everything from cloud, 
-        // PLUS very recent local logs (> 60s) that haven't hit cloud yet.
+        // Add cloud logs first (priority)
+        mappedLogs.forEach(l => logMap.set(l.id, l));
+        
+        // Add recent local logs that haven't hit cloud yet
+        const now = new Date().getTime();
         prev.forEach(p => {
           const isRecent = (now - new Date(p.timestamp).getTime()) < 60000;
-          const alreadyInCloud = combined.some(c => c.id === p.id);
-          
-          if (isRecent && !alreadyInCloud) {
-            combined.push(p);
+          if (isRecent && !logMap.has(p.id)) {
+            logMap.set(p.id, p);
           }
         });
         
-        const next = combined
+        const next = Array.from(logMap.values())
           .sort((a,b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
           .slice(0, 500);
           
@@ -1783,7 +1835,7 @@ export default function App() {
         value: t.amount,
         category: t.category,
         type: t.type,
-        profile_name: t.profile_name || 'Principal',
+        profile_name: t.profile_name,
         status: t.status || 'realizado',
         is_redutora: t.is_redutora || false,
         parent_id: t.parent_id,
@@ -1793,33 +1845,28 @@ export default function App() {
 
       // Reconciliation: Merge instead of direct overwrite to avoid concurrency loss
       setTransactions(prev => {
-        const next = [...mappedTxs];
-        const now = new Date().getTime();
+        const txMap = new Map<string, Transaction>();
         
-        // IDs currently in sync queue (pending upload)
+        // Load cloud versions first
+        mappedTxs.forEach(t => txMap.set(t.id, t));
+        
+        const now = new Date().getTime();
         const pendingIds = new Set(syncQueue.filter(q => q.type === 'tx_add' || q.type === 'tx_update').map(q => q.payload.id || q.payload));
 
         prev.forEach(p => {
-          const cloudEntry = next.find(n => n.id === p.id);
+          const cloudEntry = txMap.get(p.id);
           const isMissingInCloud = !cloudEntry;
           const isStaleInCloud = cloudEntry && new Date(cloudEntry.updatedAt).getTime() < new Date(p.updatedAt || 0).getTime();
           
-          // Protection logic:
-          // 1. If it's in the sync queue, we MUST keep local version as it's more definitive/recent
-          // 2. If it's missing in cloud but was created recently (< 5 mins), keep it
-          // 3. If it's stale in cloud (local is newer), overwrite cloud with local
           const isPending = pendingIds.has(p.id);
-          const isVeryNew = (now - new Date(p.updatedAt || 0).getTime()) < 300000; // 5 minute window
+          const isVeryNew = (now - new Date(p.updatedAt || 0).getTime()) < 300000;
           
           if (isStaleInCloud || (isMissingInCloud && (isVeryNew || isPending))) {
-             const idx = next.findIndex(n => n.id === p.id);
-             if (idx !== -1) {
-                next[idx] = p;
-             } else {
-                next.push(p);
-             }
+             txMap.set(p.id, p); // Overwrite or add local version
           }
         });
+        
+        const next = Array.from(txMap.values());
         localStorage.setItem('verdegrana_data', JSON.stringify(next));
         return next;
       });
@@ -1905,8 +1952,8 @@ export default function App() {
     setTransactions([]);
     setAuditLogs([]);
     setCategories(DEFAULT_CATEGORIES.map(c => ({ id: c.toLowerCase(), name: c })));
-    setProfilesList(['Principal']);
-    setActiveProfile('Principal');
+    setProfilesList([]);
+    setActiveProfile('');
     
     try {
       const db = await initDB();
@@ -1959,12 +2006,14 @@ export default function App() {
           setIsDemoMode(false);
           
           // Determine profile
-          const profiles = Array.from(new Set(txs.map((t: any) => t.profile_name || 'Principal')));
+          const profiles = Array.from(new Set(txs.map((t: any) => t.profile_name)));
           if (profiles.length > 1) {
             setBootStage('profile_select');
-          } else {
-            setActiveProfile(profiles[0] || 'Principal');
+          } else if (profiles.length === 1) {
+            setActiveProfile(profiles[0]);
             setBootStage('ready');
+          } else {
+            setBootStage('welcome');
           }
           
           toast.success('Arquivo local carregado!');
@@ -2002,13 +2051,9 @@ export default function App() {
             setUser(session.user);
             setIsCloudMode(true);
             
-            // ZERO-LOADING: If we have profiles locally, go to profile_select immediately
-            if (profilesList.length > 0) {
-              setBootStage('profile_select');
-              // Background sync silently in background
-              syncProfilesFromCloud(session.user.id);
+            if (!folderHandle) {
+              setBootStage('folder_setup');
             } else {
-              // Forced sync if we have nothing local
               const profiles = await syncProfilesFromCloud(session.user.id);
               if (!profiles || profiles.length === 0) setBootStage('welcome');
               else setBootStage('profile_select');
@@ -2060,7 +2105,14 @@ export default function App() {
         } else if (session?.user) {
           setUser(session.user);
           setIsCloudMode(true);
-          syncProfilesFromCloud(session.user.id).then(() => setBootStage('profile_select'));
+          if (!folderHandle) {
+            setBootStage('folder_setup');
+          } else {
+            syncProfilesFromCloud(session.user.id).then((profiles) => {
+               if (profiles.length === 0) setBootStage('welcome');
+               else setBootStage('profile_select');
+            });
+          }
         }
       });
     }
@@ -2075,7 +2127,7 @@ export default function App() {
     value: t.amount,
     category: t.category,
     type: t.type,
-    profile_name: t.profile_name || 'Principal',
+    profile_name: t.profile_name,
     status: t.status || 'realizado',
     is_redutora: t.is_redutora || false,
     parent_id: t.parent_id,
@@ -2098,6 +2150,12 @@ export default function App() {
           if (prev.some(t => t.id === newTx.id)) return prev;
           const next = [...prev, newTx];
           safeSave('verdegrana_data', next);
+          
+          // Hybrid: Auto-save to active profile folder file
+          if (folderHandle && newTx.profile_name === activeProfile) {
+            saveToFolder(activeProfile, next.filter(t => t.profile_name === activeProfile), categories);
+          }
+          
           return next;
         });
         toast.info(`⚡ Novo lançamento: ${newTx.desc}`, { duration: 2000 });
@@ -2110,6 +2168,12 @@ export default function App() {
         setTransactions(prev => {
           const next = prev.map(t => t.id === updatedTx.id ? updatedTx : t);
           safeSave('verdegrana_data', next);
+          
+          // Hybrid: Auto-save to folder
+          if (folderHandle && updatedTx.profile_name === activeProfile) {
+             saveToFolder(activeProfile, next.filter(t => t.profile_name === activeProfile), categories);
+          }
+          
           return next;
         });
       })
@@ -2121,6 +2185,12 @@ export default function App() {
         setTransactions(prev => {
           const next = prev.filter(t => t.id !== deletedId);
           localStorage.setItem('verdegrana_data', JSON.stringify(next));
+          
+          // Hybrid: Auto-save to folder
+          if (folderHandle) {
+             saveToFolder(activeProfile, next.filter(t => t.profile_name === activeProfile), categories);
+          }
+          
           return next;
         });
       })
@@ -2275,7 +2345,7 @@ export default function App() {
       const existingParent = [...transactions, ...batchTxs].find(t => 
         t.date === item.date && 
         (t.desc || "").toLowerCase().trim() === itemDescClean &&
-        (t.profile_name || 'Principal') === activeProfile &&
+        (t.profile_name) === activeProfile &&
         !t.parent_id // Match against top-level parents only
       );
 
@@ -2346,7 +2416,10 @@ export default function App() {
     // Bulk state update
     if (batchTxs.length > 0) {
       setTransactions(prev => {
-        const next = [...prev, ...batchTxs];
+        const txMap = new Map<string, Transaction>();
+        prev.forEach(t => txMap.set(t.id, t));
+        batchTxs.forEach(t => txMap.set(t.id, t));
+        const next = Array.from(txMap.values());
         pushToHistory(next);
         return next;
       });
@@ -2410,7 +2483,7 @@ export default function App() {
 
   // Calculations & Filters
   const profileTransactions = useMemo(() => {
-    return transactions.filter(t => (t.profile_name || 'Principal') === activeProfile);
+    return transactions.filter(t => (t.profile_name) === activeProfile);
   }, [transactions, activeProfile]);
 
   const currentTransactions = useMemo(() => {
@@ -2876,6 +2949,132 @@ export default function App() {
             </div>
           </motion.div>
         )}
+      </div>
+    );
+  }
+
+  if (bootStage === 'folder_setup') {
+    const isRestricted = !isFileSystemApiSupported;
+
+    return (
+      <div className="h-screen w-screen bg-slate-950 flex items-center justify-center p-8 text-center select-none">
+        <motion.div initial={{ opacity: 0, scale: 0.9, y: 20 }} animate={{ opacity: 1, scale: 1, y: 0 }} className="max-w-md w-full glass p-10 rounded-[3rem] border border-white/10 space-y-8 shadow-2xl relative">
+          <div className="space-y-6">
+             <div className={cn(
+               "w-20 h-20 rounded-[2rem] flex items-center justify-center mx-auto",
+               isRestricted ? "bg-amber-500/10 text-amber-500" : "bg-emerald-500/10 text-emerald-500"
+             )}>
+                {isRestricted ? <AlertTriangle className="w-10 h-10" /> : <FolderSync className="w-10 h-10" />}
+             </div>
+             <div className="space-y-2">
+               <h3 className="text-2xl font-black text-white uppercase tracking-tighter">
+                 {isRestricted ? "Ambiente Restrito" : "Vincular Pasta de Dados"}
+               </h3>
+               <p className="text-slate-400 text-sm leading-relaxed">
+                 {isRestricted 
+                   ? "Neste ambiente de visualização (Preview), a seleção de pastas locais está bloqueada. Seus dados serão salvos na nuvem normalmente."
+                   : "Para garantir a segurança híbrida (Nuvem + Local), selecione uma pasta no seu dispositivo onde os dados serão armazenados fisicamente."
+                 }
+               </p>
+             </div>
+             
+             <div className="space-y-4 bg-white/5 p-6 rounded-3xl border border-white/5">
+                <div className="flex gap-4 items-start text-left">
+                   <div className="w-6 h-6 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center text-[10px] font-black flex-shrink-0 mt-0.5">1</div>
+                   <p className="text-[10px] text-slate-300 font-bold uppercase tracking-widest leading-relaxed">A pasta será sincronizada em tempo real com a nuvem.</p>
+                </div>
+                <div className="flex gap-4 items-start text-left">
+                   <div className="w-6 h-6 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center text-[10px] font-black flex-shrink-0 mt-0.5">2</div>
+                   <p className="text-[10px] text-slate-300 font-bold uppercase tracking-widest leading-relaxed">Seus dados estarão seguros mesmo sem internet.</p>
+                </div>
+             </div>
+          </div>
+
+          <div className="space-y-4">
+            {isRestricted ? (
+              <button 
+                onClick={async () => {
+                  const profiles = await syncProfilesFromCloud(user?.id);
+                  if (profiles.length > 0) setBootStage('profile_select');
+                  else setBootStage('welcome');
+                }}
+                className="w-full py-6 bg-emerald-500 rounded-2xl font-black text-white text-sm uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all"
+              >
+                CONTINUAR SEM BACKUP LOCAL
+              </button>
+            ) : (
+              <button 
+                onClick={async () => {
+                  try {
+                    // @ts-ignore
+                    const handle = await window.showDirectoryPicker();
+                    setFolderHandle(handle);
+                    
+                    const profilesInFolder = await syncProfilesFromFolder(handle);
+                    
+                    if (profilesInFolder.length > 0) {
+                      setBootStage('profile_select');
+                    } else {
+                      const cloudProfiles = await syncProfilesFromCloud(user?.id);
+                      if (cloudProfiles.length > 0) {
+                        await downloadCloudToFolder(user?.id, handle);
+                        setBootStage('profile_select');
+                      } else {
+                        setBootStage('welcome');
+                      }
+                    }
+                    toast.success('Pasta vinculada!');
+                  } catch (e: any) {
+                    if (e.name === 'AbortError') return;
+                    if (e.name === 'SecurityError' || e.name === 'NotAllowedError') {
+                      toast.error("O navegador bloqueou a seleção de pastas neste ambiente.");
+                    } else {
+                      toast.error("Falha ao selecionar pasta.");
+                    }
+                  }
+                }}
+                className="w-full py-6 bg-emerald-500 rounded-2xl font-black text-white text-sm uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all"
+              >
+                SELECIONAR PASTA LOCAL
+              </button>
+            )}
+            <button 
+              onClick={handleLogout}
+              className="text-[10px] text-slate-600 font-black uppercase tracking-widest hover:text-slate-400"
+            >
+              VOLTAR AO LOGIN
+            </button>
+          </div>
+        </motion.div>
+      </div>
+    );
+  }
+
+  if (bootStage === 'sync_initial') {
+    return (
+      <div className="h-screen w-screen bg-slate-950 flex flex-col items-center justify-center space-y-10 p-12">
+        <div className="relative">
+          <motion.div 
+            animate={{ rotate: 360 }}
+            transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
+            className="w-32 h-32 border-4 border-emerald-500/10 border-t-emerald-500 rounded-full"
+          />
+          <Cloud className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 text-emerald-500 animate-pulse" />
+        </div>
+        <div className="space-y-3 text-center">
+           <h2 className="text-2xl font-black text-white uppercase tracking-tighter">Sincronização Inicial</h2>
+           <p className="text-slate-500 text-xs font-bold uppercase tracking-widest max-w-xs mx-auto leading-relaxed">
+             Baixando seus dados da nuvem para o armazenamento local físico...
+           </p>
+        </div>
+        <div className="w-full max-w-xs h-1 bg-white/5 rounded-full overflow-hidden border border-white/5 mt-4">
+           <motion.div 
+             initial={{ x: '-100%' }}
+             animate={{ x: '100%' }}
+             transition={{ duration: 2, repeat: Infinity }}
+             className="w-full h-full bg-emerald-500 shadow-[0_0_15px_rgba(16,185,129,0.5)]"
+           />
+        </div>
       </div>
     );
   }
@@ -3974,9 +4173,13 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                                         });
 
                                         if (activeProfile === p) {
-                                           const next = newList[0] || 'Principal';
+                                           const next = newList[0] || '';
                                            setActiveProfile(next);
-                                           await loadProfileData(next);
+                                           if (next) await loadProfileData(next);
+                                           else {
+                                             setTransactions([]);
+                                             setBootStage('welcome');
+                                           }
                                         }
                                       }
                                     }}
@@ -4169,7 +4372,7 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                                 supabase.from('profiles').delete().eq('user_id', user.id),
                                 supabase.from('audit_logs').delete().eq('user_id', user.id),
                                 supabase.from('userdata').update({ 
-                                  data: { auditLogs: [], profilesList: ['Principal'], categories: [] },
+                                  data: { auditLogs: [], profilesList: [], categories: [] },
                                   updated_at: new Date().toISOString()
                                 }).eq('user_id', user.id)
                               ]);
