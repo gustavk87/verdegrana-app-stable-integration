@@ -1083,7 +1083,8 @@ export default function App() {
       toast.success('Sincronização concluída: Nuvem -> Pasta Local');
     } catch (e) {
       console.error("Erro no download inicial cloud -> folder:", e);
-      toast.error('Erro ao sincronizar dados da nuvem para a pasta local.');
+      // Ensure we don't swallow the error if the caller needs it for flow control
+      throw e; 
     }
   };
 
@@ -2104,15 +2105,10 @@ export default function App() {
             setUser(session.user);
             setIsCloudMode(true);
             
-            if (!folderHandle) {
-              await ensureDelay();
-              setBootStage('folder_setup');
-            } else {
-              const profiles = await syncProfilesFromCloud(session.user.id);
-              await ensureDelay();
-              if (!profiles || profiles.length === 0) setBootStage('welcome');
-              else setBootStage('profile_select');
-            }
+            const profiles = await syncProfilesFromCloud(session.user.id);
+            await ensureDelay();
+            if (!profiles || profiles.length === 0) setBootStage('welcome');
+            else setBootStage('profile_select');
             return;
           }
         }
@@ -2167,14 +2163,10 @@ export default function App() {
         } else if (session?.user) {
           setUser(session.user);
           setIsCloudMode(true);
-          if (!folderHandle) {
-            setBootStage('folder_setup');
-          } else {
-            syncProfilesFromCloud(session.user.id).then((profiles) => {
-               if (profiles.length === 0) setBootStage('welcome');
-               else setBootStage('profile_select');
-            });
-          }
+          syncProfilesFromCloud(session.user.id).then((profiles) => {
+             if (profiles.length === 0) setBootStage('welcome');
+             else setBootStage('profile_select');
+          });
         }
       });
     }
@@ -3130,12 +3122,12 @@ export default function App() {
             transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
             className="w-32 h-32 border-4 border-emerald-500/10 border-t-emerald-500 rounded-full"
           />
-          <Cloud className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 text-emerald-500 animate-pulse" />
+          <RefreshCw className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 text-emerald-500 animate-spin-slow" />
         </div>
         <div className="space-y-3 text-center">
-           <h2 className="text-2xl font-black text-white uppercase tracking-tighter">Sincronização Inicial</h2>
+           <h2 className="text-2xl font-black text-white uppercase tracking-tighter">Baixando seus dados...</h2>
            <p className="text-slate-500 text-xs font-bold uppercase tracking-widest max-w-xs mx-auto leading-relaxed">
-             Baixando seus dados da nuvem para o armazenamento local físico...
+             Estamos sincronizando seus perfis da nuvem com este dispositivo para garantir seu acesso offline.
            </p>
         </div>
         <div className="w-full max-w-xs h-1 bg-white/5 rounded-full overflow-hidden border border-white/5 mt-4">
@@ -3257,37 +3249,38 @@ export default function App() {
                 <div className="space-y-2">
                    <h3 className="text-2xl font-black text-white uppercase tracking-tighter">Resgatar Perfil</h3>
                    <p className="text-slate-400 text-sm leading-relaxed">
-                     Encontramos o perfil <span className="text-emerald-400 font-bold">"{rescueProfile.name}"</span> na nuvem! Deseja baixá-lo e sincronizá-lo com este dispositivo?
+                     Encontramos o perfil <span className="text-emerald-400 font-bold">"{rescueProfile.name}"</span> na nuvem! Para continuar, selecione a pasta de destino neste dispositivo.
                    </p>
                 </div>
                 
                 <div className="space-y-4">
                    <button 
                      onClick={async () => {
+                       const pName = rescueProfile.name;
                        try {
-                         let handle = folderHandle;
-                         if (!handle) {
-                           // @ts-ignore
-                           handle = await window.showDirectoryPicker();
-                           setFolderHandle(handle);
-                         }
+                         // @ts-ignore
+                         const handle = await window.showDirectoryPicker();
+                         setFolderHandle(handle);
                          
-                         const loadingId = toast.loading('Baixando dados da nuvem...');
+                         // UI feedback starts here
                          await downloadCloudToFolder(user?.id, handle);
                          
-                         setActiveProfile(rescueProfile.name);
-                         await loadProfileData(rescueProfile.name);
+                         setActiveProfile(pName);
+                         await loadProfileData(pName);
                          setBootStage('ready');
                          setRescueProfile(null);
-                         toast.success('Perfil resgatado com sucesso!', { id: loadingId });
+                         toast.success('Perfil resgatado com sucesso!');
                        } catch (e: any) {
                          if (e.name === 'AbortError') return;
-                         toast.error("Falha no resgate: " + e.message);
+                         console.error("Erro fatal no resgate:", e);
+                         toast.error("Falha no resgate dos dados. Verifique sua conexão ou a pasta selecionada.");
+                         setBootStage('profile_select'); // Ensure we return to a valid state
+                         setRescueProfile(null);
                        }
                      }}
                      className="w-full py-6 bg-emerald-500 rounded-2xl font-black text-white text-sm uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all"
                    >
-                     {!folderHandle ? 'ESCOLHER PASTA DE DESTINO' : 'BAIXAR PARA PASTA ATUAL'}
+                     ESCOLHER PASTA DE DESTINO
                    </button>
                    <button 
                      onClick={() => setRescueProfile(null)}
@@ -5153,67 +5146,6 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                         </button>
                       ))}
                  </div>
-              </motion.div>
-            </div>
-          )}
-        </AnimatePresence>
-
-        <AnimatePresence>
-          {rescueProfile && (
-            <div className="fixed inset-0 z-[400] flex items-center justify-center p-6">
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => setRescueProfile(null)} className="absolute inset-0 bg-slate-950/90 backdrop-blur-xl" />
-              <motion.div initial={{ scale: 0.9, opacity: 0, y: 20 }} animate={{ scale: 1, opacity: 1, y: 0 }} exit={{ scale: 0.9, opacity: 0, y: 20 }} className="relative glass max-w-md w-full p-10 rounded-[3rem] border border-emerald-500/20 shadow-2xl text-center space-y-8">
-                <div className="w-20 h-20 bg-emerald-500/10 rounded-3xl flex items-center justify-center text-emerald-500 mx-auto">
-                  <CloudDownload className="w-10 h-10" />
-                </div>
-                <div className="space-y-3">
-                  <h2 className="text-3xl font-black text-white uppercase tracking-tighter italic">Resgate de Perfil</h2>
-                  <p className="text-slate-400 text-sm leading-relaxed">
-                    Este perfil está na nuvem, mas você ainda não vinculou uma pasta local neste dispositivo. Para continuar, escolha onde os arquivos serão salvos.
-                  </p>
-                </div>
-                
-                <div className="space-y-4">
-                  <button 
-                    onClick={async () => {
-                      try {
-                        // @ts-ignore
-                        const handle = await window.showDirectoryPicker();
-                        setFolderHandle(handle);
-                        
-                        // Download the transactions for this specific profile
-                        if (!supabase || !user) return;
-                        setSyncStatus('saving');
-                        const { data } = await supabase.from('transactions').select('*').eq('user_id', user.id).eq('profile_name', rescueProfile.name);
-                        
-                        if (data) {
-                          const mapped = data.map(mapCloudTxToLocal);
-                          const fileHandle = await handle.getFileHandle(`${rescueProfile.name}.json`, { create: true });
-                          const writable = await fileHandle.createWritable();
-                          await writable.write(JSON.stringify({ transactions: mapped, categories }, null, 2));
-                          await writable.close();
-                          
-                          setTransactions(prev => {
-                            const others = prev.filter(t => t.profile_name !== rescueProfile.name);
-                            return [...others, ...mapped];
-                          });
-                          
-                          setActiveProfile(rescueProfile.name);
-                          toast.success(`Perfil ${rescueProfile.name} resgatado com sucesso!`);
-                        }
-                        setRescueProfile(null);
-                        setSyncStatus('synced');
-                      } catch (e) {
-                         console.error(e);
-                         toast.error("Processo cancelado ou erro ao salvar.");
-                      }
-                    }}
-                    className="w-full py-5 bg-emerald-500 rounded-2xl text-white font-black uppercase text-xs tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all flex items-center justify-center gap-3"
-                  >
-                    <FolderSync className="w-5 h-5" /> Escolher Pasta de Destino
-                  </button>
-                  <button onClick={() => setRescueProfile(null)} className="text-[10px] font-black text-slate-500 uppercase tracking-widest hover:text-white transition-colors">Voltar</button>
-                </div>
               </motion.div>
             </div>
           )}
