@@ -696,9 +696,62 @@ const CategoryDonutSection = ({
   }
 };
 
-type BootStage = 'splash' | 'presentation' | 'auth' | 'folder_setup' | 'sync_initial' | 'welcome' | 'profile_select' | 'ready' | 'syncing';
+type BootStage = 'splash' | 'presentation' | 'auth' | 'folder_setup' | 'sync_initial' | 'welcome' | 'profile_select' | 'ready' | 'syncing' | 'welcome_back_folder';
 
-export default function App() {
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  public state = {
+    hasError: false,
+    error: null as Error | null
+  };
+
+  public static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  public componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("ErrorBoundary caught an error:", error, errorInfo);
+  }
+
+  public render() {
+    if (this.state.hasError) {
+      return (
+        <div className="h-screen w-screen bg-slate-950 flex flex-col items-center justify-center p-8 text-center select-none">
+          <div className="max-w-md w-full bg-slate-900 border border-rose-500/20 p-10 rounded-[3rem] space-y-8 shadow-2xl relative">
+            <div className="space-y-6">
+              <div className="w-20 h-20 bg-rose-500/10 text-rose-500 rounded-[2rem] flex items-center justify-center mx-auto">
+                <AlertTriangle className="w-10 h-10 animate-pulse text-rose-500" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-2xl font-black text-white uppercase tracking-tighter">Ops! Algo deu errado</h3>
+                <p className="text-slate-400 text-sm leading-relaxed">
+                  Ocorreu um erro inesperado no aplicativo. Seus dados locais continuam seguros.
+                </p>
+              </div>
+              <div className="bg-rose-950/20 border border-rose-500/15 p-4 rounded-2xl text-left">
+                <p className="font-mono text-xs text-rose-400 break-words font-medium">
+                  {this.state.error?.toString() || 'Erro desconhecido'}
+                </p>
+              </div>
+            </div>
+            <button 
+              onClick={() => window.location.reload()}
+              className="w-full py-6 bg-rose-500 hover:bg-rose-600 rounded-2xl font-black text-white text-sm uppercase tracking-widest transition-all active:scale-95 shadow-xl shadow-rose-500/20"
+            >
+              Recarregar Aplicativo
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return (this as any).props.children;
+  }
+}
+
+function MainApp() {
   const isFileSystemApiSupported = typeof window !== 'undefined' && 
     !!(window as any).showDirectoryPicker &&
     (() => {
@@ -713,6 +766,9 @@ export default function App() {
   const [user, setUser] = useState<any>(null);
   const [isCloudMode, setIsCloudMode] = useState(false);
   const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const [pendingWorkspaceHandle, setPendingWorkspaceHandle] = useState<any>(null);
+  const [pendingConflict, setPendingConflict] = useState<any>(null);
+  const [showUpsell, setShowUpsell] = useState(false);
   const localFileRef = useRef<HTMLInputElement>(null);
   const [isLoginMode, setIsLoginMode] = useState(true);
   const [authEmail, setAuthEmail] = useState('');
@@ -1202,32 +1258,118 @@ export default function App() {
     setSyncStatus('saving');
     
     try {
+      let cloudTxsForProfile: Transaction[] = [];
       if (isCloudMode && user && supabase) {
-        // background sync: fetchCloudData handles merging/reconciliation for ALL profiles
-        await fetchCloudData(user.id);
+        const { transactions: fetched } = await fetchCloudData(user.id);
+        cloudTxsForProfile = fetched.filter((t: Transaction) => t.profile_name === profileName.trim());
       }
       
-      // Always also try to load from folder if handle exists for this specific profile
+      let localTxsForProfile: Transaction[] = [];
+      let localModifiedTime = 0;
+      let hasLocalFile = false;
+
       if (folderHandle) {
         try {
           const fileHandle = await folderHandle.getFileHandle(`${profileName.trim()}.json`);
           const file = await fileHandle.getFile();
+          localModifiedTime = file.lastModified;
           const content = await file.text();
-          if (!content) throw new Error("Empty file");
-          const data = JSON.parse(content);
-          if (data.transactions) {
-            setTransactions(prev => {
+          if (content) {
+            const data = JSON.parse(content);
+            if (data.transactions) {
+              localTxsForProfile = data.transactions;
+              hasLocalFile = true;
+            }
+          }
+        } catch (e) {
+          console.warn(`Could not load local file for ${profileName}:`, e);
+        }
+      }
+
+      // Check for conflict
+      if (isCloudMode && user && supabase && hasLocalFile && cloudTxsForProfile.length > 0) {
+        const maxCloudUpdatedAt = cloudTxsForProfile.reduce((max: number, tx: Transaction) => {
+          const t = tx.updatedAt || (tx as any).updated_at;
+          const ts = t ? new Date(t).getTime() : 0;
+          return Math.max(max, ts);
+        }, 0);
+
+        const timeDiff = Math.abs(maxCloudUpdatedAt - localModifiedTime);
+        const countDiff = cloudTxsForProfile.length !== localTxsForProfile.length;
+        
+        // If modified dates differ by > 15 seconds AND contents or transaction count are different
+        if (timeDiff > 15000 && (countDiff || JSON.stringify(cloudTxsForProfile.map((t: Transaction) => t.id).sort()) !== JSON.stringify(localTxsForProfile.map((t: Transaction) => t.id).sort()))) {
+          const choice = await new Promise<'local' | 'cloud'>((resolveChoice) => {
+            setPendingConflict({
+              profileName,
+              localModified: localModifiedTime,
+              localCount: localTxsForProfile.length,
+              localTxs: localTxsForProfile,
+              cloudModified: maxCloudUpdatedAt,
+              cloudCount: cloudTxsForProfile.length,
+              cloudTxs: cloudTxsForProfile,
+              resolve: (c: 'local' | 'cloud') => {
+                setPendingConflict(null);
+                resolveChoice(c);
+              }
+            });
+          });
+
+          if (choice === 'local') {
+            setTransactions((prev: Transaction[]) => {
               const otherProfiles = prev.filter(t => t.profile_name !== profileName.trim());
-              const next = [...otherProfiles, ...data.transactions];
+              const next = [...otherProfiles, ...localTxsForProfile];
               setHistory([next]);
               setHistoryPointer(0);
               return next;
             });
+            
+            // Queue local version to cloud for saving
+            localTxsForProfile.forEach((t: Transaction) => {
+              const task: SyncTask = {
+                id: crypto.randomUUID(),
+                type: 'tx_add',
+                payload: t,
+                retryCount: 0
+              };
+              setSyncQueue((prev: SyncTask[]) => [...prev, task]);
+            });
+            toast.success('Usando versão local. Alterações sendo enviadas para a Nuvem.');
+          } else {
+            setTransactions((prev: Transaction[]) => {
+              const otherProfiles = prev.filter(t => t.profile_name !== profileName.trim());
+              const next = [...otherProfiles, ...cloudTxsForProfile];
+              setHistory([next]);
+              setHistoryPointer(0);
+              return next;
+            });
+            await saveToFolder(profileName.trim(), cloudTxsForProfile, categories);
+            toast.success('Usando versão da Nuvem. Arquivo local atualizado.');
           }
-        } catch (e) {
-          console.warn(`Could not load local file for ${profileName}:`, e);
-          // If in cloud mode, we already have some data from fetchCloudData
-          // If not in cloud mode and file fails, we might have empty state which is fine
+          setSyncStatus('synced');
+          return;
+        }
+      }
+
+      // If no conflict:
+      if (hasLocalFile) {
+        setTransactions((prev: Transaction[]) => {
+          const otherProfiles = prev.filter(t => t.profile_name !== profileName.trim());
+          const next = [...otherProfiles, ...localTxsForProfile];
+          setHistory([next]);
+          setHistoryPointer(0);
+          return next;
+        });
+      } else if (cloudTxsForProfile.length > 0) {
+        setTransactions((prev: Transaction[]) => {
+          const otherProfiles = prev.filter(t => t.profile_name !== profileName.trim());
+          const next = [...otherProfiles, ...cloudTxsForProfile];
+          setHistory([next]);
+          setHistoryPointer(0);
+          return next;
+        });
+        if (folderHandle) {
+          await saveToFolder(profileName.trim(), cloudTxsForProfile, categories);
         }
       }
       setSyncStatus('synced');
@@ -1884,6 +2026,7 @@ export default function App() {
 
   const fetchCloudData = async (userId: string) => {
     if (!supabase) return { transactions: [] };
+    const startTime = Date.now();
     try {
       setSyncStatus('saving');
       // Load Categories and Metadata from userdata
@@ -2009,6 +2152,9 @@ export default function App() {
         localStorage.setItem('verdegrana_data', JSON.stringify(next));
         return next;
       });
+
+      const elapsed = Date.now() - startTime;
+      if (elapsed < 850) await delay(850 - elapsed);
 
       setSyncStatus('synced');
       return { transactions: mappedTxs };
@@ -2165,6 +2311,43 @@ export default function App() {
     input.click();
   };
 
+  const handleWelcomeBackFolderYes = async () => {
+    if (!pendingWorkspaceHandle) return;
+    try {
+      const permission = await (pendingWorkspaceHandle as any).requestPermission({ mode: 'readwrite' });
+      if (permission === 'granted') {
+        setFolderHandle(pendingWorkspaceHandle);
+        const localProfiles = await syncProfilesFromFolder(pendingWorkspaceHandle);
+        
+        let cloudProfiles: ProfileInfo[] = [];
+        if (supabase && user) {
+          cloudProfiles = await syncProfilesFromCloud(user.id);
+        }
+        
+        const combinedProfiles = mergeProfiles(cloudProfiles, localProfiles);
+        if (combinedProfiles.length > 0) {
+          setBootStage('profile_select');
+        } else {
+          setBootStage('welcome');
+        }
+        toast.success(`Pasta [${pendingWorkspaceHandle.name}] conectada com sucesso!`);
+      } else {
+        toast.warning('Permissão recusada. Escolha outra pasta.');
+        setBootStage('folder_setup');
+      }
+    } catch (e: any) {
+      console.error("Erro ao solicitar permissão de volta:", e);
+      toast.error('Não foi possível conectar à pasta anterior.');
+      setBootStage('folder_setup');
+    }
+  };
+
+  const handleWelcomeBackFolderNo = () => {
+    setPendingWorkspaceHandle(null);
+    setFolderHandle(null);
+    setBootStage('folder_setup');
+  };
+
   // --- Initial Boot & Persistence ---
   useEffect(() => {
     const boot = async () => {
@@ -2200,22 +2383,14 @@ export default function App() {
         }
 
         // 2. Check for Local Folder
-        let localProfiles: ProfileInfo[] = [];
-        if (persisted?.workspaceHandle) {
-          try {
-            const permission = await (persisted.workspaceHandle as any).queryPermission({ mode: 'readwrite' });
-            if (permission === 'granted') {
-              setFolderHandle(persisted.workspaceHandle);
-              localProfiles = await syncProfilesFromFolder(persisted.workspaceHandle);
-            } else {
-              toast.info('Seus arquivos locais estão bloqueados. Conecte a pasta novamente nas configurações.');
-            }
-          } catch (e) {
-            console.error("Erro ao verificar permissão da pasta:", e);
-          }
+        if (persisted?.workspaceHandle && isFileSystemApiSupported) {
+          setPendingWorkspaceHandle(persisted.workspaceHandle);
+          await ensureDelay();
+          setBootStage('welcome_back_folder');
+          return;
         }
 
-        const combinedProfiles = mergeProfiles(cloudProfiles, localProfiles);
+        const combinedProfiles = mergeProfiles(cloudProfiles, []);
         
         if (combinedProfiles.length > 0) {
           await ensureDelay();
@@ -2443,12 +2618,38 @@ export default function App() {
     document.addEventListener('visibilitychange', handleVisibilityChange);
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [isCloudMode, user]);
+
+  // Periodic Background Polling as WebSocket fallback
+  useEffect(() => {
+    if (!isCloudMode || !user || !supabase) return;
+
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible' && navigator.onLine) {
+        console.log("Periodic background poll: Fetching cloud data...");
+        fetchCloudData(user.id);
+      }
+    }, 6000); // 6 seconds poll period for immediate reactivity
+
+    return () => clearInterval(interval);
+  }, [isCloudMode, user]);
   useEffect(() => {
     if (bootStage !== 'ready') return;
     if (folderHandle) {
       saveToFolder(activeProfile, transactions, categories);
     }
   }, [transactions, categories, folderHandle, bootStage, activeProfile]);
+
+  // Local Discovery / Cloud Backup Upsell Trigger
+  useEffect(() => {
+    if (bootStage === 'ready' && !isCloudMode && transactions.length >= 3) {
+      if (!localStorage.getItem('verdegrana_upsell_shown_v2')) {
+        const timer = setTimeout(() => {
+          setShowUpsell(true);
+        }, 2000);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [bootStage, isCloudMode, transactions.length]);
 
   // Debounced Cloud Sync for Metadata
   useEffect(() => {
@@ -3235,6 +3436,54 @@ export default function App() {
               className="text-[10px] text-slate-600 font-black uppercase tracking-widest hover:text-slate-400"
             >
               VOLTAR AO LOGIN
+            </button>
+          </div>
+        </motion.div>
+      </div>
+    );
+  }
+
+  if (bootStage === 'welcome_back_folder') {
+    return (
+      <div className="h-screen w-screen bg-slate-950 flex items-center justify-center p-8 text-center select-none">
+        <motion.div 
+          initial={{ opacity: 0, scale: 0.9, y: 20 }} 
+          animate={{ opacity: 1, scale: 1, y: 0 }} 
+          className="max-w-md w-full glass p-10 rounded-[3rem] border border-white/10 space-y-8 shadow-2xl relative"
+        >
+          <div className="space-y-6">
+             <div className="w-20 h-20 bg-emerald-500/10 rounded-[2rem] flex items-center justify-center mx-auto text-emerald-500">
+                <FolderSync className="w-10 h-10 animate-pulse text-emerald-500" />
+             </div>
+             <div className="space-y-2">
+               <h3 className="text-2xl font-black text-white uppercase tracking-tighter">
+                 👋 Bem-vindo de volta!
+               </h3>
+               <p className="text-slate-400 text-sm leading-relaxed">
+                 Deseja continuar utilizando sua pasta local para salvar e sincronizar seus dados fisicamente?
+               </p>
+             </div>
+             
+             <div className="bg-white/5 p-5 rounded-2xl border border-white/5 text-center">
+                <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest block mb-1">Pasta Anterior de Dados</span>
+                <span className="text-sm font-mono text-emerald-400 font-bold break-all">
+                  {pendingWorkspaceHandle?.name || "Pasta Conectada"}
+                </span>
+             </div>
+          </div>
+
+          <div className="flex flex-col gap-4">
+            <button 
+              onClick={handleWelcomeBackFolderYes}
+              className="w-full py-6 bg-emerald-500 hover:bg-emerald-600 rounded-2xl font-black text-white text-sm uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all text-center flex items-center justify-center gap-2"
+            >
+              Sim, continuar usando
+            </button>
+            <button 
+              onClick={handleWelcomeBackFolderNo}
+              className="w-full py-4 bg-white/5 border border-white/10 text-slate-400 hover:text-white rounded-2xl font-black text-xs uppercase tracking-widest active:scale-95 transition-all"
+            >
+              Escolher outra pasta
             </button>
           </div>
         </motion.div>
@@ -5282,7 +5531,152 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
           )}
         </AnimatePresence>
       </AnimatePresence>
+
+      {/* Upsell Local Discovery -> Cloud Sync Modal */}
+      <AnimatePresence>
+        {showUpsell && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-6 bg-slate-950/90 backdrop-blur-md">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="max-w-md w-full bg-slate-900 border border-white/10 rounded-[3rem] p-10 space-y-8 shadow-2xl relative"
+            >
+              <button 
+                onClick={() => {
+                  setShowUpsell(false);
+                  localStorage.setItem('verdegrana_upsell_shown_v2', 'true');
+                }} 
+                className="absolute top-8 right-8 p-2 text-slate-500 hover:text-white"
+              >
+                <X className="w-5 h-5"/>
+              </button>
+              
+              <div className="space-y-6">
+                 <div className="w-20 h-20 bg-emerald-500/10 rounded-[2rem] flex items-center justify-center mx-auto text-emerald-500">
+                    <Cloud className="w-10 h-10 animate-bounce" />
+                 </div>
+                 <div className="space-y-2 text-center">
+                   <h3 className="text-2xl font-black text-white uppercase tracking-tighter border-none bg-transparent">Descoberta Local</h3>
+                   <p className="text-slate-400 text-sm leading-relaxed px-2">
+                     Notamos que sua pasta local ainda não está na nuvem. Gostaria de fazer o backup e vinculá-la agora?
+                   </p>
+                 </div>
+                 
+                 <div className="space-y-4 bg-white/5 p-6 rounded-3xl border border-white/5">
+                    <div className="flex gap-4">
+                       <div className="w-6 h-6 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center text-[10px] font-black flex-shrink-0">✓</div>
+                       <p className="text-[11px] text-slate-300 font-bold uppercase tracking-widest leading-relaxed">Protege seus lançamentos contra perdas mecânicas ou do navegador.</p>
+                    </div>
+                    <div className="flex gap-4">
+                       <div className="w-6 h-6 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center text-[10px] font-black flex-shrink-0">✓</div>
+                       <p className="text-[11px] text-slate-300 font-bold uppercase tracking-widest leading-relaxed">Sincroniza instantaneamente entre todas as suas telas (Celular + PC).</p>
+                    </div>
+                 </div>
+              </div>
+
+              <div className="space-y-4 pt-4">
+                <button 
+                  onClick={async () => {
+                    setShowUpsell(false);
+                    localStorage.setItem('verdegrana_upsell_shown_v2', 'true');
+                    await handleCloudMigration();
+                  }}
+                  className="w-full py-6 bg-emerald-500 rounded-2xl font-black text-white text-sm uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all text-center flex items-center justify-center gap-2"
+                >
+                  <Cloud className="w-4 h-4" /> Sim, ativar backup na Nuvem
+                </button>
+                <button 
+                  onClick={() => {
+                    setShowUpsell(false);
+                    localStorage.setItem('verdegrana_upsell_shown_v2', 'true');
+                  }}
+                  className="w-full py-4 bg-white/5 border border-white/10 text-slate-400 hover:text-white rounded-2xl font-black text-xs uppercase tracking-widest active:scale-95 transition-all"
+                >
+                  Agora não, retornar ao painel
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Conflict Resolution Modal */}
+      <AnimatePresence>
+        {pendingConflict && (
+          <div className="fixed inset-0 z-[120] flex items-center justify-center p-6 bg-slate-950/95 backdrop-blur-md">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="max-w-xl w-full bg-slate-900 border border-white/10 rounded-[3rem] p-10 space-y-8 shadow-2xl relative"
+            >
+              <div className="space-y-6">
+                 <div className="w-20 h-20 bg-amber-500/10 rounded-[2rem] flex items-center justify-center mx-auto text-amber-500">
+                    <AlertTriangle className="w-10 h-10 animate-bounce" />
+                 </div>
+                 <div className="space-y-2 text-center">
+                   <h3 className="text-2xl font-black text-white uppercase tracking-tighter">Conflito de Sincronização</h3>
+                   <p className="text-slate-400 text-sm leading-relaxed max-w-md mx-auto">
+                     Encontramos diferenças entre seus dados da pasta local e a versão armazenada na nuvem para o perfil <code className="text-amber-400 font-bold">"{pendingConflict.profileName}"</code>.
+                   </p>
+                 </div>
+                 
+                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Local File version */}
+                    <div className="bg-slate-950 p-6 rounded-3xl border border-white/5 space-y-4 flex flex-col justify-between">
+                       <div className="space-y-2">
+                          <span className="text-[10px] text-emerald-400 font-black uppercase tracking-widest bg-emerald-500/10 px-2 py-1 rounded-full">Dispositivo Local</span>
+                          <h4 className="text-lg font-black text-white leading-none">Pasta do Aparelho</h4>
+                          <p className="text-xs text-slate-400">Dados gravados fisicamente na sua pasta local conectada.</p>
+                       </div>
+                       <div className="space-y-1 py-3 text-slate-300 text-xs">
+                          <p>📝 Lançamentos: <strong>{pendingConflict.localCount}</strong></p>
+                          <p>🕒 Modificado: <strong>{new Date(pendingConflict.localModified).toLocaleString('pt-BR')}</strong></p>
+                       </div>
+                       <button 
+                          onClick={() => pendingConflict.resolve('local')}
+                          className="w-full py-3 bg-emerald-500/10 hover:bg-emerald-500 hover:text-slate-950 rounded-xl font-bold text-emerald-400 text-xs uppercase tracking-widest transition-all"
+                       >
+                          Manter versão Local
+                       </button>
+                    </div>
+
+                    {/* Cloud Version */}
+                    <div className="bg-slate-950 p-6 rounded-3xl border border-white/5 space-y-4 flex flex-col justify-between">
+                       <div className="space-y-2">
+                          <span className="text-[10px] text-sky-400 font-black uppercase tracking-widest bg-sky-500/10 px-2 py-1 rounded-full">Nuvem Supabase</span>
+                          <h4 className="text-lg font-black text-white leading-none">Servidor Nuvem</h4>
+                          <p className="text-xs text-slate-400">Última versão salva remotamente no banco de dados.</p>
+                       </div>
+                       <div className="space-y-1 py-3 text-slate-300 text-xs">
+                          <p>📝 Lançamentos: <strong>{pendingConflict.cloudCount}</strong></p>
+                          <p>🕒 Modificado: <strong>{pendingConflict.cloudModified ? new Date(pendingConflict.cloudModified).toLocaleString('pt-BR') : 'Sem registro'}</strong></p>
+                       </div>
+                       <button 
+                          onClick={() => pendingConflict.resolve('cloud')}
+                          className="w-full py-3 bg-sky-500/10 hover:bg-sky-500 hover:text-slate-950 rounded-xl font-bold text-sky-400 text-xs uppercase tracking-widest transition-all"
+                       >
+                          Manter versão Nuvem
+                       </button>
+                    </div>
+                 </div>
+              </div>
+              
+              <p className="text-[10px] text-slate-500 text-center uppercase tracking-widest">A versão descartada será substituída permanentemente.</p>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ErrorBoundary>
+      <MainApp />
+    </ErrorBoundary>
   );
 }
 
