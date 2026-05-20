@@ -58,7 +58,10 @@ import {
   ChevronDown,
   Mic,
   Save,
-  MessageSquare
+  MessageSquare,
+  Layers,
+  Calendar,
+  Infinity as InfinityIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
@@ -155,9 +158,21 @@ interface Transaction {
   profile_name: string;
   status: TransactionStatus;
   is_redutora: boolean;
+  is_parent?: boolean;
   parent_id?: string;
   parent_name?: string;
   updatedAt?: string;
+  // Recurrence
+  is_recurring?: boolean;
+  recurrence_rule?: {
+    type: 'daily' | 'weekly' | 'monthly' | 'yearly';
+    interval: number;
+    dayOfWeek?: number;
+    dayOfMonth?: number;
+  };
+  // Pending
+  pending_date_mode?: 'fixed' | 'undefined' | 'user_chosen';
+  pending_prediction_date?: string;
 }
 
 interface AuditLog {
@@ -329,31 +344,55 @@ const CategoryDonut = ({ data, colorMode }: {
         };
       }
 
-      // 2-Dataset approach
+      // 4-Dataset approach for opacity rule
+      const hasInactive = data.some(d => (d.inactiveIncome || 0) > 0 || (d.inactiveExpense || 0) > 0);
+      
       return {
         labels: data.map(d => d.name),
         datasets: [
           {
-            label: 'Receitas',
+            label: 'Receitas (Filtrado)',
             data: data.map(d => d.income),
             backgroundColor: 'rgba(16, 185, 129, 0.9)',
             borderColor: data.map((_, i) => i === activeIndex ? '#ffffff' : 'transparent'),
             borderWidth: data.map((_, i) => i === activeIndex ? 3 : 0),
+            borderRadius: hasInactive ? 0 : 6,
+            barPercentage: 0.9,
+            categoryPercentage: 0.8,
+            stack: 'income',
+          },
+          {
+            label: 'Outras Receitas',
+            data: data.map(d => d.inactiveIncome || 0),
+            backgroundColor: 'rgba(16, 185, 129, 0.15)',
+            borderColor: 'transparent',
+            borderWidth: 0,
             borderRadius: 6,
             barPercentage: 0.9,
             categoryPercentage: 0.8,
-            grouped: true,
+            stack: 'income',
           },
           {
-            label: 'Despesas',
+            label: 'Despesas (Filtrado)',
             data: data.map(d => d.expense),
             backgroundColor: 'rgba(244, 63, 94, 0.9)',
             borderColor: data.map((_, i) => i === activeIndex ? '#ffffff' : 'transparent'),
             borderWidth: data.map((_, i) => i === activeIndex ? 3 : 0),
+            borderRadius: hasInactive ? 0 : 6,
+            barPercentage: 0.9,
+            categoryPercentage: 0.8,
+            stack: 'expense',
+          },
+          {
+            label: 'Outras Despesas',
+            data: data.map(d => d.inactiveExpense || 0),
+            backgroundColor: 'rgba(244, 63, 94, 0.15)',
+            borderColor: 'transparent',
+            borderWidth: 0,
             borderRadius: 6,
             barPercentage: 0.9,
             categoryPercentage: 0.8,
-            grouped: true,
+            stack: 'expense',
           }
         ]
       };
@@ -452,7 +491,7 @@ const CategoryDonut = ({ data, colorMode }: {
     },
     scales: {
       x: { 
-        stacked: false,
+        stacked: true,
         grid: { 
           color: 'rgba(255,255,255,0.05)', 
           lineWidth: 1,
@@ -487,7 +526,7 @@ const CategoryDonut = ({ data, colorMode }: {
         } 
       },
       y: { 
-        stacked: false,
+        stacked: true,
         min: isPerformance ? undefined : 0,
         max: maxVal * 1.2,
         grid: { color: 'rgba(255,255,255,0.03)' }, 
@@ -618,16 +657,21 @@ const CategoryDonutSection = ({
   colorMode, 
   setColorMode, 
   viewMode, 
-  setViewMode,
-  title
+  setViewMode, 
+  title,
+  onCategoryClick
 }: { 
   data: any[], 
-  colorMode: 'unique' | 'flow', 
-  setColorMode?: (m: 'unique' | 'flow') => void, 
-  viewMode: 'tudo' | 'receitas' | 'despesas', 
-  setViewMode?: (m: 'tudo' | 'receitas' | 'despesas') => void, 
-  title: string
+  colorMode: 'unique' | 'flow',
+  setColorMode?: (m: 'unique' | 'flow') => void,
+  viewMode: 'tudo' | 'receitas' | 'despesas',
+  setViewMode?: (m: 'tudo' | 'receitas' | 'despesas') => void,
+  title: string,
+  onCategoryClick?: (catName: string) => void
 }) => {
+  const [showModes, setShowModes] = useState(false);
+  const chartRef = useRef(null);
+
   try {
     return (
       <div className="flex flex-col h-full">
@@ -670,7 +714,7 @@ const CategoryDonutSection = ({
           )}
         </div>
         
-        <div className="flex-1 min-h-[250px] relative">
+        <div className="flex-1 min-h-[250px] relative cursor-pointer" onClick={() => onCategoryClick && data[0] && onCategoryClick(data[0].name)}>
           <CategoryDonut data={data} colorMode={colorMode} />
         </div>
 
@@ -682,14 +726,19 @@ const CategoryDonutSection = ({
                 let fill = colorMode === 'unique' ? VIBRANT_PALETTE[i % VIBRANT_PALETTE.length] : (dominantType === 'entrada' ? '#10b981' : '#f43f5e');
 
                 return (
-                  <div key={cat.name} className="flex items-center justify-between text-[10px] bg-white/2 p-2 rounded-xl border border-white/5">
+                  <div 
+                    key={cat.name} 
+                    onClick={() => onCategoryClick && onCategoryClick(cat.name)}
+                    className="flex items-center justify-between text-[10px] bg-white/2 p-2 rounded-xl border border-white/5 cursor-pointer hover:bg-white/5 active:scale-95 transition-all group"
+                  >
                     <div className="flex items-center gap-2">
                       <div className="w-2 h-2 rounded-full" style={{ backgroundColor: fill, opacity: colorMode === 'unique' ? 1 : 0.4 + (i * 0.1) }} />
-                      <span className="font-bold text-slate-400 truncate max-w-[120px] tracking-tight">{cat.name}</span>
+                      <span className="font-bold text-slate-400 group-hover:text-white truncate max-w-[120px] tracking-tight">{cat.name}</span>
                     </div>
                     <div className="flex items-center gap-2">
                         <span className="font-black text-white">{formatCurrency(cat.value)}</span>
                         <span className="text-[8px] text-slate-600 font-bold">{( (cat.value / (data.reduce((a,b)=>a+b.value, 0) || 1)) * 100).toFixed(0)}%</span>
+                        <ChevronRight className="w-3 h-3 text-slate-700 opacity-0 group-hover:opacity-100 transition-opacity" />
                     </div>
                   </div>
                 );
@@ -705,6 +754,86 @@ const CategoryDonutSection = ({
 };
 
 type BootStage = 'splash' | 'presentation' | 'auth' | 'folder_setup' | 'sync_initial' | 'welcome' | 'profile_select' | 'ready' | 'syncing' | 'welcome_back_folder';
+
+const DrilldownModal = ({ 
+  isOpen, 
+  onClose, 
+  category, 
+  transactions,
+  activeProfile
+}: { 
+  isOpen: boolean, 
+  onClose: () => void, 
+  category: string, 
+  transactions: Transaction[],
+  activeProfile: string
+}) => {
+  return (
+    <AnimatePresence>
+      {isOpen && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center p-6">
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose} className="absolute inset-0 bg-slate-950/90 backdrop-blur-md" />
+          <motion.div 
+            initial={{ scale: 0.9, opacity: 0, y: 20 }} 
+            animate={{ scale: 1, opacity: 1, y: 0 }} 
+            exit={{ scale: 0.9, opacity: 0, y: 20 }} 
+            className="relative glass max-w-4xl w-full p-10 rounded-[3.5rem] border border-white/10 shadow-2xl flex flex-col max-h-[85vh] overflow-hidden"
+          >
+            <div className="flex justify-between items-center mb-8 shrink-0">
+               <div className="space-y-1">
+                 <div className="flex items-center gap-3">
+                   <div className="p-2 bg-emerald-500/10 rounded-xl text-emerald-400"><Layers className="w-5 h-5" /></div>
+                   <h2 className="text-3xl font-black text-white uppercase tracking-tighter shrink-0 truncate max-w-[400px]">Expandir: {category}</h2>
+                 </div>
+                 <p className="text-slate-500 text-[10px] font-black uppercase tracking-widest pl-1">Visualizando lançamentos detalhados da sub-seção</p>
+               </div>
+               <button onClick={onClose} className="p-3 bg-white/5 hover:bg-rose-500/10 hover:text-rose-500 rounded-full transition-all text-slate-500"><X/></button>
+            </div>
+            
+            <div className="flex-1 overflow-y-auto space-y-4 pr-4 custom-scrollbar pb-4">
+               {transactions.length === 0 ? (
+                 <div className="py-20 text-center text-slate-700 font-black uppercase tracking-widest text-xs">Nenhum lançamento nesta categoria para o período selecionado</div>
+               ) : (
+                 transactions.map(t => (
+                   <div key={t.id} className="flex items-center justify-between p-5 bg-white/2 rounded-3xl border border-white/5 hover:border-white/10 transition-all group">
+                      <div className="flex items-center gap-4">
+                         <div className={cn("w-10 h-10 rounded-xl flex items-center justify-center", t.type === 'entrada' ? 'bg-emerald-500/10 text-emerald-500' : 'bg-rose-500/10 text-rose-500')}>
+                            {t.type === 'entrada' ? <TrendingUp size={16}/> : <TrendingDown size={16}/>}
+                         </div>
+                         <div className="min-w-0">
+                            <p className="text-white font-bold text-sm tracking-tight truncate max-w-[200px]">{t.desc}</p>
+                            <div className="flex items-center gap-2">
+                               <p className="text-[10px] text-slate-600 font-mono italic">{new Date(t.date).toLocaleDateString()}</p>
+                               {t.status === 'pendente' && <span className="text-[8px] font-black uppercase text-amber-500 bg-amber-500/10 px-1.5 rounded-full">Pendente</span>}
+                            </div>
+                         </div>
+                      </div>
+                      <div className="text-right">
+                         <p className={cn("text-lg font-black tracking-tighter", t.type === 'entrada' ? 'text-emerald-400' : 'text-rose-400')}>
+                            {t.type === 'entrada' ? '+' : '-'} {formatCurrency(t.value)}
+                         </p>
+                      </div>
+                   </div>
+                 ))
+               )}
+            </div>
+            
+            <div className="pt-6 border-t border-white/5 shrink-0 flex justify-end">
+               <div className="flex items-center gap-6">
+                  <div className="text-right">
+                     <p className="text-[9px] font-black text-slate-600 uppercase tracking-widest">Equilíbrio da Seção</p>
+                     <p className={cn("text-3xl font-black tracking-tighter", transactions.reduce((acc: number, t: any) => acc + (t.type === 'entrada' ? Number(t.value) : -Number(t.value)), 0) >= 0 ? "text-emerald-400" : "text-rose-400")}>
+                        {formatCurrency(transactions.reduce((acc: number, t: any) => acc + (t.type === 'entrada' ? Number(t.value) : -Number(t.value)), 0))}
+                     </p>
+                  </div>
+               </div>
+            </div>
+          </motion.div>
+        </div>
+      )}
+    </AnimatePresence>
+  );
+}
 
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -974,18 +1103,22 @@ function MainApp() {
   const [sortConfig, setSortConfig] = useState<'default' | 'updated' | 'value'>('default');
   const [valueSortOrder, setValueSortOrder] = useState<'asc' | 'desc'>('desc');
   const [updateSortOrder, setUpdateSortOrder] = useState<'asc' | 'desc'>('desc');
-  const [isParentModalOpen, setIsParentModalOpen] = useState(false);
-  const [parentSearchTerm, setParentSearchTerm] = useState('');
-  const [donutColorMode, setDonutColorMode] = useState<'unique' | 'flow'>('unique');
-  const [isComparisonModalOpen, setIsComparisonModalOpen] = useState(false);
-  const [categoryToDelete, setCategoryToDelete] = useState<Category | null>(null);
   const [isAiProcessing, setIsAiProcessing] = useState(false);
   const [donutType, setDonutType] = useState<'saída' | 'entrada'>('saída');
-  const [donutViewMode, setDonutViewMode] = useState<'tudo' | 'receitas' | 'despesas'>('despesas');
+  const [isParentModalOpen, setIsParentModalOpen] = useState(false);
+  const [parentSearchTerm, setParentSearchTerm] = useState('');
+  const [donutColorMode, setDonutColorMode] = useState<'unique' | 'flow'>('flow');
+  const [isComparisonModalOpen, setIsComparisonModalOpen] = useState(false);
+  const [categoryToDelete, setCategoryToDelete] = useState<Category | null>(null);
+  const [donutViewMode, setDonutViewMode] = useState<'tudo' | 'receitas' | 'despesas'>('tudo');
   const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null);
   const [quickAddDate, setQuickAddDate] = useState<string | null>(null);
   const [isChartReady, setIsChartReady] = useState(false);
   const [isDashboardRevealed, setIsDashboardRevealed] = useState(false);
+  const [drilldownCategory, setDrilldownCategory] = useState<string | null>(null);
+  const [isDrilldownModalOpen, setIsDrilldownModalOpen] = useState(false);
+  const [isPendente, setIsPendente] = useState(false);
+  const [isRecurring, setIsRecurring] = useState(false);
   
   // Folder Sync handles
   const [folderHandle, setFolderHandle] = useState<any>(null);
@@ -2079,6 +2212,59 @@ function MainApp() {
     }
   };
 
+  // Recurring Scheduling Engine
+  useEffect(() => {
+    if (activeProfile && bootStage === 'ready' && !isBooting) {
+      const recurringTxs = transactions.filter(t => t.is_recurring && t.profile_name === activeProfile);
+      if (recurringTxs.length === 0) return;
+
+      let hasNew = false;
+      const nextTxs: Transaction[] = [];
+
+      recurringTxs.forEach(base => {
+        if (!base.recurrence_rule) return;
+        
+        const chain = transactions.filter(t => t.desc === base.desc && t.profile_name === activeProfile);
+        let latestDate = new Date(base.date);
+        chain.forEach(tx => {
+          const d = new Date(tx.date);
+          if (d > latestDate) latestDate = d;
+        });
+
+        const next = new Date(latestDate);
+        const { type, interval } = base.recurrence_rule;
+        if (type === 'daily') next.setDate(next.getDate() + interval);
+        else if (type === 'weekly') next.setDate(next.getDate() + (7 * interval));
+        else if (type === 'monthly') next.setMonth(next.getMonth() + interval);
+        else if (type === 'yearly') next.setFullYear(next.getFullYear() + interval);
+
+        const today = new Date();
+        today.setHours(0,0,0,0);
+
+        if (next <= today) {
+          const ds = next.toISOString().split('T')[0];
+          const exists = transactions.some(t => t.desc === base.desc && t.date === ds && t.profile_name === activeProfile);
+          if (!exists) {
+            nextTxs.push({
+              ...base,
+              id: crypto.randomUUID(),
+              date: ds,
+              status: 'pendente',
+              updatedAt: new Date().toISOString()
+            });
+            hasNew = true;
+          }
+        }
+      });
+
+      if (hasNew) {
+        setTransactions(prev => [...prev, ...nextTxs]);
+        nextTxs.forEach(nt => logAudit('Agendamento', activeProfile, nt.desc, nt.value, null, nt, nt.id));
+        toast.info(`${nextTxs.length} agendamentos processados`);
+      }
+    }
+  }, [activeProfile, bootStage, isBooting, transactions.length]);
+
   const handleUpdateTransaction = async (id: string, data: Partial<Transaction>) => {
     const tx = transactions.find(t => t.id === id);
     const oldTx = tx ? { ...tx } : null;
@@ -3008,6 +3194,7 @@ function MainApp() {
     const seen = new Set<string>();
     return transactions.filter(t => {
       if (t.profile_name !== activeProfile) return false;
+      if (!t.id) return false; // Safety
       if (seen.has(t.id)) return false;
       seen.add(t.id);
       return true;
@@ -3016,11 +3203,10 @@ function MainApp() {
 
   const currentTransactions = useMemo(() => {
     return profileTransactions.filter(t => {
-      const date = new Date(t.date);
-      // High-level filters
-      if (viewMode === 'receitas' && t.type !== 'entrada') return false;
-      if (viewMode === 'despesas' && t.type !== 'saída') return false;
+      // Exclude children accounts from main view as per requirement
+      if (t.parent_id || t.parent_name) return false;
 
+      const date = new Date(t.date);
       if (dateFilter.type === 'all') {
         return true;
       } else if (dateFilter.type === 'month') {
@@ -3032,7 +3218,18 @@ function MainApp() {
       }
       return false;
     });
-  }, [profileTransactions, dateFilter, viewMode]);
+  }, [profileTransactions, dateFilter]);
+
+  const dashboardFilteredTxs = useMemo(() => {
+    return currentTransactions.filter(t => {
+      if (viewMode === 'receitas' && t.type !== 'entrada') return false;
+      if (viewMode === 'despesas' && t.type !== 'saída') return false;
+      if (viewMode === 'personalizado' && categoryFilters.length > 0) {
+        if (!categoryFilters.includes(t.category)) return false;
+      }
+      return true;
+    });
+  }, [currentTransactions, viewMode, categoryFilters]);
 
 
   const filteredTransactions = useMemo(() => {
@@ -3086,7 +3283,13 @@ function MainApp() {
     const orphans = filtered.filter(t => t.parent_id && !exhibitedIds.has(t.id));
     result.push(...orphans.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()));
 
-    return result;
+    // Final safety deduplication to prevent React key errors
+    const finalSeen = new Set<string>();
+    return result.filter(t => {
+      if (!t.id || finalSeen.has(t.id)) return false;
+      finalSeen.add(t.id);
+      return true;
+    });
   }, [currentTransactions, searchTerm, categoryFilters, sortConfig, updateSortOrder, valueSortOrder]);
 
   const stats = useMemo(() => {
@@ -3125,15 +3328,25 @@ function MainApp() {
   }, [currentTransactions]);
 
   const fluxoData = useMemo(() => {
-    if (filteredTransactions.length === 0) return [];
-
-    const dates = filteredTransactions.map(t => new Date(t.date).getTime()).filter(d => !isNaN(d));
+    const results = [];
+    if (currentTransactions.length === 0) return [];
+    
+    // We base the timeline on the period context (currentTransactions)
+    const dates = currentTransactions.map(t => new Date(t.date).getTime()).filter(d => !isNaN(d));
     if (dates.length === 0) return [];
     const minD = new Date(Math.min(...dates));
     const maxD = new Date(Math.max(...dates));
 
-    const results = [];
-    
+    const checkMatch = (t: Transaction) => {
+      // Global Dashboard Filters
+      if (viewMode === 'receitas' && t.type !== 'entrada') return false;
+      if (viewMode === 'despesas' && t.type !== 'saída') return false;
+      if (viewMode === 'personalizado' && categoryFilters.length > 0) {
+        return categoryFilters.includes(t.category);
+      }
+      return true;
+    };
+
     if (analyticsConfig.granularity === 'day') {
       const start = new Date(minD);
       start.setDate(start.getDate() - 2);
@@ -3145,15 +3358,22 @@ function MainApp() {
       while (curr <= end && safety < 1000) {
         safety++;
         const dStr = curr.toISOString().split('T')[0];
-        const dayTxs = filteredTransactions.filter(t => t.date === dStr);
-        const income = dayTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
-        const expense = dayTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+        const dayTxs = currentTransactions.filter(t => t.date === dStr);
         
+        const income = dayTxs.filter(t => t.type === 'entrada' && checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+        const expense = dayTxs.filter(t => t.type === 'saída' && checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+        
+        // Inactive (for opacity)
+        const inactiveIncome = dayTxs.filter(t => t.type === 'entrada' && !checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+        const inactiveExpense = dayTxs.filter(t => t.type === 'saída' && !checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+
         results.push({ 
             name: curr.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }), 
             fullDate: curr.toISOString(),
-            income: isNaN(income) ? 0 : Math.max(0, income), 
-            expense: isNaN(expense) ? 0 : Math.max(0, expense) 
+            income: Math.max(0, income), 
+            expense: Math.max(0, expense),
+            inactiveIncome: Math.max(0, inactiveIncome),
+            inactiveExpense: Math.max(0, inactiveExpense)
         });
         curr.setDate(curr.getDate() + 1);
       }
@@ -3167,13 +3387,77 @@ function MainApp() {
         safety++;
         let income = 0;
         let expense = 0;
+        let inactiveIncome = 0;
+        let inactiveExpense = 0;
         let name = '';
         let fullDate = curr.toISOString();
 
         if (analyticsConfig.granularity === 'month') {
           const m = curr.getMonth();
           const y = curr.getFullYear();
-          const pTxs = filteredTransactions.filter(t => {
+          const pTxs = currentTransactions.filter(t => {
+            const d = new Date(t.date);
+            return d.getMonth() === m && d.getFullYear() === y;
+          });
+          income = pTxs.filter(t => t.type === 'entrada' && checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          expense = pTxs.filter(t => t.type === 'saída' && checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          inactiveIncome = pTxs.filter(t => t.type === 'entrada' && !checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          inactiveExpense = pTxs.filter(t => t.type === 'saída' && !checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+
+          name = curr.toLocaleString('pt-BR', { month: 'short' });
+          curr.setMonth(curr.getMonth() + 1);
+        } else {
+          const y = curr.getFullYear();
+          const pTxs = currentTransactions.filter(t => new Date(t.date).getFullYear() === y);
+          income = pTxs.filter(t => t.type === 'entrada' && checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          expense = pTxs.filter(t => t.type === 'saída' && checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          inactiveIncome = pTxs.filter(t => t.type === 'entrada' && !checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          inactiveExpense = pTxs.filter(t => t.type === 'saída' && !checkMatch(t)).reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+          
+          name = y.toString();
+          curr.setFullYear(curr.getFullYear() + 1);
+        }
+        results.push({ name, fullDate, income: Math.max(0, income), expense: Math.max(0, expense), inactiveIncome: Math.max(0, inactiveIncome), inactiveExpense: Math.max(0, inactiveExpense) });
+      }
+    }
+    return results;
+  }, [currentTransactions, analyticsConfig.granularity, viewMode, categoryFilters]);
+
+  // Tendencia (Valor Acumulado) ignores type/category filters but follows dates
+  const tendenciaData = useMemo(() => {
+    const results = [];
+    if (currentTransactions.length === 0) return [];
+    
+    const dates = currentTransactions.map(t => new Date(t.date).getTime()).filter(d => !isNaN(d));
+    const minD = new Date(Math.min(...dates));
+    const maxD = new Date(Math.max(...dates));
+
+    if (analyticsConfig.granularity === 'day') {
+      let curr = new Date(minD);
+      let safety = 0;
+      while (curr <= maxD && safety < 1000) {
+        safety++;
+        const dStr = curr.toISOString().split('T')[0];
+        const dayTxs = currentTransactions.filter(t => t.date === dStr);
+        const income = dayTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+        const expense = dayTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
+        results.push({ name: curr.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' }), fullDate: curr.toISOString(), income, expense });
+        curr.setDate(curr.getDate() + 1);
+      }
+    } else {
+      let curr = analyticsConfig.granularity === 'month' ? new Date(minD.getFullYear(), minD.getMonth(), 1) : new Date(minD.getFullYear(), 0, 1);
+      const end = analyticsConfig.granularity === 'month' ? new Date(maxD.getFullYear(), maxD.getMonth(), 1) : new Date(maxD.getFullYear(), 0, 1);
+      let safety = 0;
+      while (curr <= end && safety < 500) {
+        safety++;
+        let income = 0;
+        let expense = 0;
+        let name = '';
+        const fullDate = curr.toISOString();
+        if (analyticsConfig.granularity === 'month') {
+          const m = curr.getMonth();
+          const y = curr.getFullYear();
+          const pTxs = currentTransactions.filter(t => {
             const d = new Date(t.date);
             return d.getMonth() === m && d.getFullYear() === y;
           });
@@ -3183,27 +3467,24 @@ function MainApp() {
           curr.setMonth(curr.getMonth() + 1);
         } else {
           const y = curr.getFullYear();
-          const pTxs = filteredTransactions.filter(t => new Date(t.date).getFullYear() === y);
+          const pTxs = currentTransactions.filter(t => new Date(t.date).getFullYear() === y);
           income = pTxs.filter(t => t.type === 'entrada').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
           expense = pTxs.filter(t => t.type === 'saída').reduce((acc, t) => acc + (t.is_redutora ? -Number(t.value || 0) : Number(t.value || 0)), 0);
           name = y.toString();
           curr.setFullYear(curr.getFullYear() + 1);
         }
-        results.push({ name, fullDate, income: isNaN(income) ? 0 : Math.max(0, income), expense: isNaN(expense) ? 0 : Math.max(0, expense) });
+        results.push({ name, fullDate, income, expense });
       }
     }
     return results;
-  }, [filteredTransactions, analyticsConfig.granularity]);
-
-  const tendenciaData = useMemo(() => {
-    return fluxoData; // Use same filtered data for both charts to ensure consistency
-  }, [fluxoData]);
+  }, [currentTransactions, analyticsConfig.granularity]);
 
   const categoryData = useMemo(() => {
     const expByCat: Record<string, number> = {};
     const incByCat: Record<string, number> = {};
     
-    currentTransactions.forEach(t => {
+    // Distribution strictly follows the dashboard filters
+    dashboardFilteredTxs.forEach(t => {
       const val = Number(t.value) || 0;
       const amount = t.is_redutora ? -val : val;
       const catName = (t.category || 'Outros').trim();
@@ -3235,7 +3516,7 @@ function MainApp() {
       })
       .filter(item => item.value > 0)
       .sort((a, b) => b.value - a.value);
-  }, [currentTransactions, donutViewMode]);
+  }, [dashboardFilteredTxs, donutViewMode]);
 
   const periodDetailsTransactions = useMemo(() => {
     if (!selectedPeriod) return [];
@@ -3721,9 +4002,9 @@ function MainApp() {
           </div>
 
           <div className="grid grid-cols-2 gap-4 max-h-[350px] overflow-y-auto pr-2 custom-scrollbar">
-            {allProfiles.map(p => (
+            {allProfiles.map((p, idx) => (
               <button
-                key={p.name}
+                key={`${p.name}-${p.source}-${idx}`}
                 onClick={async () => {
                   if (p.source === 'cloud' && isFileSystemApiSupported) {
                     setRescueProfile(p);
@@ -4161,29 +4442,32 @@ function MainApp() {
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap items-center justify-between gap-4 border-t border-white/5 pt-6">
-                    <div className="flex items-center gap-3">
-                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Filtro Rápido Personalizado:</span>
-                      <button 
-                        onClick={() => setIsComparisonModalOpen(true)}
-                        disabled={viewMode !== 'personalizado'}
-                        className={cn(
-                          "flex items-center gap-2 px-4 py-2 rounded-full text-[10px] font-black transition-all border",
-                          viewMode === 'personalizado' ? "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30" : "bg-white/5 text-slate-700 border-white/5 opacity-50 cursor-not-allowed"
-                        )}
-                      >
-                        <Plus className="w-3 h-3" /> SELECIONAR CATEGORIAS
-                      </button>
-                      {analyticsConfig.compareCategories.length > 0 && viewMode === 'personalizado' && (
+                  {viewMode === 'personalizado' && (
+                    <motion.div 
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="flex flex-wrap items-center justify-between gap-4 border-t border-white/5 pt-6 overflow-hidden"
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Filtro Rápido Personalizado:</span>
                         <button 
-                          onClick={() => setAnalyticsConfig(p => ({ ...p, compareCategories: [] }))}
-                          className="text-[9px] font-bold text-rose-500 hover:scale-105 transition-transform"
+                          onClick={() => setIsComparisonModalOpen(true)}
+                          className="flex items-center gap-2 px-4 py-2 rounded-full text-[10px] font-black transition-all border bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
                         >
-                          Limpar
+                          <Plus className="w-3 h-3" /> SELECIONAR CATEGORIAS
                         </button>
-                      )}
-                    </div>
-                  </div>
+                        {categoryFilters.length > 0 && (
+                          <button 
+                            onClick={() => setCategoryFilters([])}
+                            className="text-[9px] font-bold text-rose-500 hover:scale-105 transition-transform"
+                          >
+                            Limpar ({categoryFilters.length})
+                          </button>
+                        )}
+                      </div>
+                    </motion.div>
+                  )}
                 </div>
 
                 {profileTransactions.length === 0 ? (
@@ -4235,6 +4519,10 @@ function MainApp() {
                         setColorMode={setDonutColorMode}
                         viewMode={donutViewMode}
                         setViewMode={setDonutViewMode}
+                        onCategoryClick={(catName) => {
+                          setDrilldownCategory(catName);
+                          setIsDrilldownModalOpen(true);
+                        }}
                       />
                     </Card>
 
@@ -4393,59 +4681,100 @@ function MainApp() {
                       </div>
 
                       <div className="space-y-3">
-                        {filteredTransactions.map(t => (
-                          <div
-                            key={t.id}
-                            className={cn(
-                              "flex items-center justify-between p-4 rounded-3xl border transition-all cursor-pointer relative overflow-hidden group",
-                              selectedTxIds.includes(t.id) 
-                                ? "bg-emerald-500/10 border-emerald-500/50" 
-                                : "bg-white/2 border-white/5 hover:border-white/20",
-                              t.is_redutora && "bg-blue-500/5 border-blue-500/20",
-                              t.parent_id && sortConfig === 'default' && "ml-8 opacity-90 border-dashed border-white/10"
-                            )}
-                            onClick={() => setSelectedTxIds(p => p.includes(t.id) ? p.filter(id => id !== t.id) : [...p, t.id])}
-                          >
-                            <div className="flex items-center gap-4 flex-1 min-w-0">
-                              {t.parent_id && sortConfig === 'default' && (
-                                <CornerDownRight className="w-4 h-4 text-blue-400 shrink-0" />
-                              )}
-                              <div className={cn(
-                                "w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0 transition-transform group-hover:scale-110", 
-                                t.is_redutora ? "bg-blue-500/10 text-blue-400" :
-                                (t.type === 'entrada' ? "bg-emerald-500/10 text-emerald-500" : "bg-rose-500/10 text-rose-500")
-                              )}>
-                                {t.is_redutora ? <Minus className="w-6 h-6" /> : (t.type === 'entrada' ? <TrendingUp className="w-6 h-6" /> : <TrendingDown className="w-6 h-6" />)}
-                              </div>
-                              <div className="min-w-0">
-                                 <div className="flex items-center gap-2">
-                                   <p className="font-bold text-white text-sm truncate">{t.desc}</p>
-                                   {t.status === 'pendente' && <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />}
-                                 </div>
-                                 <div className="flex items-center gap-1.5 overflow-hidden">
-                                   <span className={cn("text-[9px] font-black uppercase tracking-[0.15em]", t.is_redutora ? "text-blue-400/80" : "text-slate-500")}>
-                                     {t.is_redutora ? `Redutora • ${t.category}` : t.category}
-                                   </span>
-                                   <span className="text-[8px] text-slate-700 font-mono">•</span>
-                                   <span className="text-[9px] text-slate-600 font-mono">{new Date(t.date).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}</span>
-                                 </div>
-                              </div>
-                            </div>
+                        {filteredTransactions.map(t => {
+                          const isParent = t.is_parent;
+                          const subTxs = transactions.filter(st => st.parent_id === t.id);
+                          const subTotal = subTxs.reduce((acc, st) => {
+                            const val = Number(st.value) || 0;
+                            return acc + (st.is_redutora ? -val : val);
+                          }, 0);
+                          const valorReal = (Number(t.value) || 0) + subTotal;
 
-                            <div className="text-right flex flex-col items-end gap-1 flex-shrink-0 cursor-default" onClick={e => e.stopPropagation()}>
-                               <p className={cn("font-black text-sm", 
-                                 t.is_redutora ? "text-blue-400" :
-                                 (t.type === 'entrada' ? "text-emerald-400" : "text-rose-400")
-                               )}>
-                                 {t.is_redutora ? '-' : (t.type === 'entrada' ? '+' : '-')} {formatCurrency(t.value)}
-                               </p>
-                               {t.parent_name && (
-                                 <div className="flex items-center gap-1 px-2 py-0.5 bg-white/5 rounded-full">
-                                   <ArrowDownUp className="w-2.5 h-2.5 text-slate-600" />
-                                   <p className="text-[8px] text-slate-500 font-bold uppercase truncate max-w-[80px]">{t.parent_name}</p>
-                                 </div>
-                               )}
-                            </div>
+                          return (
+                            <div
+                              key={t.id}
+                              className={cn(
+                                "flex items-center justify-between p-4 rounded-3xl border transition-all cursor-pointer relative overflow-hidden group",
+                                selectedTxIds.includes(t.id) 
+                                  ? "bg-emerald-500/10 border-emerald-500/50" 
+                                  : "bg-white/2 border-white/5 hover:border-white/20",
+                                t.is_redutora && "bg-blue-500/5 border-blue-500/20",
+                                t.parent_id && sortConfig === 'default' && "ml-8 opacity-90 border-dashed border-white/10"
+                              )}
+                              onClick={() => setSelectedTxIds(p => p.includes(t.id) ? p.filter(id => id !== t.id) : [...p, t.id])}
+                            >
+                              <div className="flex items-center gap-4 flex-1 min-w-0">
+                                {t.parent_id && sortConfig === 'default' && (
+                                  <CornerDownRight className="w-4 h-4 text-blue-400 shrink-0" />
+                                )}
+                                <div className={cn(
+                                  "w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0 transition-transform group-hover:scale-110", 
+                                  t.is_redutora ? "bg-blue-500/10 text-blue-400" :
+                                  (t.type === 'entrada' ? "bg-emerald-500/10 text-emerald-500" : "bg-rose-500/10 text-rose-500")
+                                )}>
+                                  {t.is_redutora ? <Minus className="w-6 h-6" /> : (t.type === 'entrada' ? <TrendingUp className="w-6 h-6" /> : <TrendingDown className="w-6 h-6" />)}
+                                </div>
+                                <div className="min-w-0">
+                                   <div className="flex items-center gap-2">
+                                     <p className="font-bold text-white text-sm truncate">{t.desc}</p>
+                                     {t.status === 'pendente' && <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />}
+                                     {t.is_recurring && <InfinityIcon className="w-3 h-3 text-emerald-500/50" />}
+                                   </div>
+                                   <div className="flex items-center gap-1.5 overflow-hidden">
+                                     <span className={cn("text-[9px] font-black uppercase tracking-[0.15em]", t.is_redutora ? "text-blue-400/80" : "text-slate-500")}>
+                                       {t.is_redutora ? `Redutora • ${t.category}` : t.category}
+                                     </span>
+                                     <span className="text-[8px] text-slate-700 font-mono">•</span>
+                                     <span className="text-[9px] text-slate-600 font-mono">
+                                       {new Date(t.date).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}
+                                       {t.pending_prediction_date && t.status === 'pendente' && (
+                                         <span className="text-amber-500/80 ml-1">→ {new Date(t.pending_prediction_date).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}</span>
+                                       )}
+                                     </span>
+                                   </div>
+                                </div>
+                              </div>
+
+                              <div className="text-right flex flex-col items-end gap-1 flex-shrink-0 cursor-default" onClick={e => e.stopPropagation()}>
+                                 {isParent ? (
+                                   <div className="flex flex-col items-end">
+                                     <p className="text-[10px] font-black text-white/40 uppercase tracking-widest leading-none mb-1">Valor Real</p>
+                                     <p className={cn("font-black text-base leading-none", valorReal >= 0 ? "text-emerald-400" : "text-rose-400")}>
+                                       {formatCurrency(valorReal)}
+                                     </p>
+                                     <div className="flex items-center gap-1 mt-1 opacity-60">
+                                       <span className="text-[8px] font-black uppercase text-slate-500">Isolado:</span>
+                                       <span className="text-[10px] font-bold text-slate-300">{formatCurrency(t.value)}</span>
+                                     </div>
+                                   </div>
+                                 ) : (
+                                   <p className={cn("font-black text-sm", 
+                                     t.is_redutora ? "text-blue-400" :
+                                     (t.type === 'entrada' ? "text-emerald-400" : "text-rose-400")
+                                   )}>
+                                     {t.is_redutora ? '-' : (t.type === 'entrada' ? '+' : '-')} {formatCurrency(t.value)}
+                                   </p>
+                                 )}
+                                 
+                                 {(t.parent_name || (isParent && subTxs.length > 0)) && (
+                                   <div className={cn(
+                                     "flex items-center gap-1 px-2 py-0.5 bg-white/5 rounded-full mt-1",
+                                     isParent ? "border border-emerald-500/20 bg-emerald-500/5" : ""
+                                   )}>
+                                     {isParent ? (
+                                       <>
+                                         <Layers className="w-2.5 h-2.5 text-emerald-500" />
+                                         <p className="text-[8px] text-emerald-400 font-bold uppercase">{subTxs.length} Subcontas</p>
+                                       </>
+                                     ) : (
+                                       <>
+                                         <ArrowDownUp className="w-2.5 h-2.5 text-slate-600" />
+                                         <p className="text-[8px] text-slate-500 font-bold uppercase truncate max-w-[80px]">{t.parent_name}</p>
+                                       </>
+                                     )}
+                                   </div>
+                                 )}
+                              </div>
 
                             <AnimatePresence>
                               {selectedTxIds.includes(t.id) && (
@@ -4460,7 +4789,8 @@ function MainApp() {
                               )}
                             </AnimatePresence>
                           </div>
-                        ))}
+                        );
+                        })}
                         
                         {filteredTransactions.length === 0 && (
                           <div className="py-20 flex flex-col items-center gap-4 text-slate-700">
@@ -4487,7 +4817,14 @@ function MainApp() {
 
                   <div className="space-y-3">
                     {(() => {
-                      const filteredLogs = auditLogs.filter(log => log.metadata?.profile === activeProfile);
+                      const seenLogs = new Set<string>();
+                      const filteredLogs = auditLogs.filter(log => {
+                        if (!log.id || seenLogs.has(log.id)) return false;
+                        if (log.metadata?.profile !== activeProfile) return false;
+                        seenLogs.add(log.id);
+                        return true;
+                      });
+                      
                       if (filteredLogs.length === 0) {
                         return (
                           <div className="py-20 text-center text-slate-500 font-bold uppercase tracking-widest text-[10px]">Tudo limpo por aqui. Nenhuma ação registrada.</div>
@@ -4984,9 +5321,9 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                   </div>
 
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                     {allProfiles.map(p => (
+                     {allProfiles.map((p, idx) => (
                        <div 
-                         key={p.name}
+                         key={`${p.name}-${p.source}-${idx}`}
                          className={cn(
                            "p-6 rounded-[2rem] border transition-all flex flex-col gap-4 relative group",
                            activeProfile === p.name ? "bg-emerald-500/10 border-emerald-500/50" : "bg-white/5 border-white/5 hover:border-white/10"
@@ -5476,38 +5813,45 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                </div>
                
                <div className="grid grid-cols-2 gap-3 max-h-[400px] overflow-y-auto pr-2 custom-scrollbar">
-                  {categories.map(cat => {
-                    const totalExp = profileTransactions.filter(t => t.category === cat.name && t.type === 'saída').reduce((acc, t) => acc + t.value, 0);
-                    const totalInc = profileTransactions.filter(t => t.category === cat.name && t.type === 'entrada').reduce((acc, t) => acc + t.value, 0);
-                    const isSelected = analyticsConfig.compareCategories.includes(cat.name);
-                    
-                    return (
-                      <button 
-                        key={cat.id}
-                        onClick={() => {
-                          setAnalyticsConfig(p => ({
-                            ...p,
-                            compareCategories: isSelected
-                              ? p.compareCategories.filter(n => n !== cat.name)
-                              : [...p.compareCategories, cat.name]
-                          }));
-                        }}
-                        className={cn(
-                          "p-4 rounded-2xl border text-left transition-all group",
-                          isSelected ? "bg-emerald-500/20 border-emerald-500" : "bg-white/5 border-white/5 hover:border-white/20"
-                        )}
-                      >
-                         <div className="flex justify-between items-start mb-2">
-                           <span className={cn("font-bold text-sm transition-colors", isSelected ? "text-emerald-400" : "text-slate-400")}>{cat.name}</span>
-                           {isSelected && <div className="w-2 h-2 bg-emerald-500 rounded-full" />}
-                         </div>
-                         <div className="flex flex-col gap-1">
-                            <span className="text-[10px] text-emerald-500/60 font-medium">Entradas: {formatCurrency(totalInc)}</span>
-                            <span className="text-[10px] text-rose-500/60 font-medium">Saídas: {formatCurrency(totalExp)}</span>
-                         </div>
-                      </button>
-                    );
-                  })}
+                  {(() => {
+                    const seenCats = new Set<string>();
+                    return categories.filter(c => {
+                      if (!c.id || seenCats.has(c.id)) return false;
+                      seenCats.add(c.id);
+                      return true;
+                    }).map(cat => {
+                      const totalExp = profileTransactions.filter(t => t.category === cat.name && t.type === 'saída').reduce((acc, t) => acc + t.value, 0);
+                      const totalInc = profileTransactions.filter(t => t.category === cat.name && t.type === 'entrada').reduce((acc, t) => acc + t.value, 0);
+                      const isSelected = analyticsConfig.compareCategories.includes(cat.name);
+                      
+                      return (
+                        <button 
+                          key={cat.id}
+                          onClick={() => {
+                            setAnalyticsConfig(p => ({
+                              ...p,
+                              compareCategories: isSelected
+                                ? p.compareCategories.filter(n => n !== cat.name)
+                                : [...p.compareCategories, cat.name]
+                            }));
+                          }}
+                          className={cn(
+                            "p-4 rounded-2xl border text-left transition-all group",
+                            isSelected ? "bg-emerald-500/20 border-emerald-500" : "bg-white/5 border-white/5 hover:border-white/20"
+                          )}
+                        >
+                           <div className="flex justify-between items-start mb-2">
+                             <span className={cn("font-bold text-sm transition-colors", isSelected ? "text-emerald-400" : "text-slate-400")}>{cat.name}</span>
+                             {isSelected && <div className="w-2 h-2 bg-emerald-500 rounded-full" />}
+                           </div>
+                           <div className="flex flex-col gap-1">
+                              <span className="text-[10px] text-emerald-500/60 font-medium">Entradas: {formatCurrency(totalInc)}</span>
+                              <span className="text-[10px] text-rose-500/60 font-medium">Saídas: {formatCurrency(totalExp)}</span>
+                           </div>
+                        </button>
+                      );
+                    });
+                  })()}
                </div>
                
                <button onClick={() => setIsComparisonModalOpen(false)} className="w-full py-4 bg-emerald-600 rounded-2xl font-bold hover:bg-emerald-500 transition-all active:scale-95 shadow-xl shadow-emerald-500/20">
@@ -5550,6 +5894,14 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
 
       {/* MODALS & OVERLAYS */}
       <AnimatePresence>
+        <DrilldownModal 
+          isOpen={isDrilldownModalOpen}
+          onClose={() => setIsDrilldownModalOpen(false)}
+          category={drilldownCategory || ''}
+          activeProfile={activeProfile}
+          transactions={profileTransactions.filter(t => t.category === drilldownCategory)}
+        />
+
         {isAddModalOpen && (
           <div className="fixed inset-0 z-[100] flex items-end md:items-center justify-center p-0 md:p-6">
             <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-slate-950/80 backdrop-blur-md" onClick={() => setIsAddModalOpen(false)} />
@@ -5592,6 +5944,14 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                   profile_name: activeProfile,
                   status: fd.get('status_toggle') === 'on' ? 'realizado' : 'pendente' as TransactionStatus,
                   is_redutora,
+                  is_parent: fd.get('is_parent_toggle') === 'on',
+                  is_recurring: fd.get('is_recurring_toggle') === 'on',
+                  recurrence_rule: fd.get('is_recurring_toggle') === 'on' ? {
+                    type: fd.get('rec_type') as any,
+                    interval: parseInt(fd.get('rec_interval') as string) || 1
+                  } : undefined,
+                  pending_date_mode: fd.get('pending_date_mode') as any,
+                  pending_prediction_date: fd.get('pending_prediction_date') as string,
                   parent_id: (isAnexo && parent_id && isUUID(parent_id)) ? parent_id : null,
                   parent_name: (isAnexo && parent_id) ? profileTransactions.find(t => t.id === parent_id)?.desc : null
                 };
@@ -5613,7 +5973,14 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                       <label className="flex items-center cursor-pointer gap-2">
                         <span className="text-[8px] font-bold text-slate-300">Pendente</span>
                         <div className="relative">
-                          <input name="status_toggle" type="checkbox" defaultChecked={editingTransaction?.status === 'realizado' || !editingTransaction} className="sr-only peer" />
+                          <input 
+                            name="status_toggle" 
+                            type="checkbox" 
+                            id="status_toggle_id"
+                            defaultChecked={editingTransaction?.status === 'realizado' || !editingTransaction} 
+                            onChange={(e) => setIsPendente(!e.target.checked)}
+                            className="sr-only peer" 
+                          />
                           <div className="w-8 h-4 bg-slate-800 rounded-full peer peer-checked:bg-emerald-500 transition-all animate-none" />
                           <div className="absolute left-1 top-1 w-2 h-2 bg-white rounded-full peer-checked:translate-x-4 transition-all" />
                         </div>
@@ -5626,7 +5993,7 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                       <label className="flex items-center cursor-pointer gap-2">
                         <div className="relative">
                           <input 
-                            name="is_redutora_toggle" 
+                            name="is_anexo_toggle" 
                             type="checkbox" 
                             checked={isAnexo}
                             onChange={(e) => setIsAnexo(e.target.checked)}
@@ -5638,6 +6005,103 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                       </label>
                     </div>
                   </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="flex items-center justify-between p-3 bg-emerald-500/5 rounded-2xl border border-emerald-500/20">
+                      <div className="flex flex-col">
+                        <span className="text-[9px] font-black uppercase text-emerald-400">Conta/Subcotas (Pai)</span>
+                        <span className="text-[7px] text-emerald-600 font-bold uppercase">Permite anexos subordinados</span>
+                      </div>
+                      <label className="flex items-center cursor-pointer gap-2">
+                        <div className="relative">
+                          <input 
+                            name="is_parent_toggle" 
+                            type="checkbox" 
+                            defaultChecked={editingTransaction?.is_parent}
+                            className="sr-only peer" 
+                          />
+                          <div className="w-8 h-4 bg-slate-800 rounded-full peer peer-checked:bg-emerald-600 transition-all animate-none" />
+                          <div className="absolute left-1 top-1 w-2 h-2 bg-white rounded-full peer-checked:translate-x-4 transition-all" />
+                        </div>
+                      </label>
+                    </div>
+
+                    <div className="flex items-center justify-between p-3 bg-white/5 rounded-2xl border border-white/5">
+                      <div className="flex flex-col">
+                        <span className="text-[9px] font-black uppercase text-slate-400">Recorrência</span>
+                        <span className="text-[7px] text-slate-600 font-bold uppercase">Repetir automaticamente</span>
+                      </div>
+                      <label className="flex items-center cursor-pointer gap-2">
+                        <div className="relative">
+                          <input 
+                            name="is_recurring_toggle" 
+                            type="checkbox" 
+                            checked={isRecurring}
+                            onChange={(e) => setIsRecurring(e.target.checked)}
+                            className="sr-only peer" 
+                          />
+                          <div className="w-8 h-4 bg-slate-800 rounded-full peer peer-checked:bg-indigo-500 transition-all animate-none" />
+                          <div className="absolute left-1 top-1 w-2 h-2 bg-white rounded-full peer-checked:translate-x-4 transition-all" />
+                        </div>
+                      </label>
+                    </div>
+                  </div>
+
+                  {isPendente && (
+                    <div className="p-4 bg-amber-500/5 rounded-2xl border border-amber-500/20 space-y-4">
+                       <div className="flex items-center gap-2 mb-2">
+                          <Calendar className="w-3 h-3 text-amber-500" />
+                          <span className="text-[9px] uppercase font-black text-amber-500 tracking-widest">Tratamento de Lançamento Pendente</span>
+                       </div>
+                       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                          <div className="flex flex-col gap-1.5">
+                             <label className="text-[8px] uppercase font-black text-amber-600 ml-1">Modo de Previsão</label>
+                             <select 
+                               name="pending_date_mode" 
+                               defaultValue={editingTransaction?.pending_date_mode || 'fixed'}
+                               className="w-full h-10 bg-white/5 border border-white/5 rounded-xl px-4 text-white outline-none text-[10px] font-bold"
+                             >
+                                <option value="fixed" className="bg-slate-900">Data Fixa Definida</option>
+                                <option value="undefined" className="bg-slate-900">Data Indefinida (?)</option>
+                                <option value="user_chosen" className="bg-slate-900">Válido somente em...</option>
+                             </select>
+                          </div>
+                          <div className="flex flex-col gap-1.5">
+                             <label className="text-[8px] uppercase font-black text-amber-600 ml-1">Previsão Realizável em:</label>
+                             <input 
+                               name="pending_prediction_date" 
+                               type="date" 
+                               defaultValue={editingTransaction?.pending_prediction_date || new Date().toISOString().split('T')[0]}
+                               className="w-full h-10 bg-white/5 border border-white/5 rounded-xl px-4 text-white outline-none font-mono text-[10px]" 
+                             />
+                          </div>
+                       </div>
+                    </div>
+                  )}
+
+                  {isRecurring && (
+                    <div className="p-4 bg-indigo-500/5 rounded-2xl border border-indigo-500/20 space-y-4">
+                       <div className="flex items-center gap-2 mb-2">
+                          <InfinityIcon className="w-3 h-3 text-indigo-500" />
+                          <span className="text-[9px] uppercase font-black text-indigo-500 tracking-widest">Configuração de Recorrência</span>
+                       </div>
+                       <div className="grid grid-cols-2 gap-3">
+                          <div className="flex flex-col gap-1.5">
+                             <label className="text-[8px] uppercase font-black text-indigo-600 ml-1">Frequência</label>
+                             <select name="rec_type" defaultValue={editingTransaction?.recurrence_rule?.type || 'monthly'} className="w-full h-10 bg-white/5 border border-white/5 rounded-xl px-4 text-white outline-none text-[10px] font-bold">
+                                <option value="daily" className="bg-slate-900">Diária</option>
+                                <option value="weekly" className="bg-slate-900">Semanal</option>
+                                <option value="monthly" className="bg-slate-900">Mensal</option>
+                                <option value="yearly" className="bg-slate-900">Anual</option>
+                             </select>
+                          </div>
+                          <div className="flex flex-col gap-1.5">
+                             <label className="text-[8px] uppercase font-black text-indigo-600 ml-1">Intervalo</label>
+                             <input name="rec_interval" type="number" defaultValue={editingTransaction?.recurrence_rule?.interval || 1} min="1" className="w-full h-10 bg-white/5 border border-white/5 rounded-xl px-4 text-white outline-none text-[10px] font-black" />
+                          </div>
+                       </div>
+                    </div>
+                  )}
 
                   {isAnexo && (
                     <div className="flex flex-col gap-3 p-4 bg-blue-500/5 rounded-2xl border border-blue-500/20">
@@ -6062,7 +6526,14 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                                   setPreviewData(next);
                                 }}
                               >
-                                {categories.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+                                {(() => {
+                                  const seen = new Set<string>();
+                                  return categories.filter(c => {
+                                    if (!c.id || seen.has(c.id)) return false;
+                                    seen.add(c.id);
+                                    return true;
+                                  }).map(c => <option key={c.id} value={c.name}>{c.name}</option>);
+                                })()}
                               </select>
                             </div>
                           </div>
@@ -6099,7 +6570,7 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                                 {previewData.some(p => !p.parent_id && !p.parent_name && p.tempId !== item.tempId) && (
                                   <optgroup label="Novas Contas no Import">
                                     {previewData.filter(p => !p.parent_id && !p.parent_name && p.tempId !== item.tempId).map(p => (
-                                      <option key={p.id} value={p.id}>{p.desc}</option>
+                                      <option key={p.tempId} value={p.id}>{p.desc}</option>
                                     ))}
                                   </optgroup>
                                 )}
