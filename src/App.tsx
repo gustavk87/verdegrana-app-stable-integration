@@ -1060,19 +1060,64 @@ function MainApp() {
     setSyncStatus('synced');
   }, [supabase, isCloudMode, user, syncQueue, clientId]);
 
+  // 1. Connection Event Listeners with Beautiful Toast notification
   useEffect(() => {
-    const handleOnline = () => processSyncQueue();
+    const handleOnline = () => {
+      toast.success("🟢 Conexão restabelecida. Sincronizando dados...");
+      processSyncQueue();
+    };
+    const handleOffline = () => {
+      toast.error("⚠️ Você está offline. As alterações foram salvas localmente.");
+    };
     window.addEventListener('online', handleOnline);
-    return () => window.removeEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
   }, [processSyncQueue]);
 
-  // Periodic retry for failed tasks
+  // 2. Immediate, Event-Driven sync trigger on queue changes (Gatilho de Saída)
+  useEffect(() => {
+    if (syncQueue.length > 0 && syncStatus !== 'saving') {
+      console.log('Event-driven: queue change detected, running sync...');
+      processSyncQueue();
+    }
+  }, [syncQueue.length, syncStatus, processSyncQueue]);
+
+  // 3. Backup Retry scheduler only for failed queue items (no intervals, just delayed timeouts)
   useEffect(() => {
     if (syncQueue.length > 0) {
-      const timer = setTimeout(processSyncQueue, 5000);
+      const timer = setTimeout(() => {
+        if (syncStatus !== 'saving') {
+          console.log('Event-driven fallback: retrying remaining queue...');
+          processSyncQueue();
+        }
+      }, 7000); 
       return () => clearTimeout(timer);
     }
-  }, [syncQueue.length, processSyncQueue]);
+  }, [syncQueue.length, syncStatus, processSyncQueue]);
+
+  // 4. Premium Toast Status Notification Manager
+  const syncToastIdRef = useRef<any>(null);
+
+  useEffect(() => {
+    if (syncStatus === 'saving' && syncQueue.length > 0) {
+      if (!syncToastIdRef.current) {
+        syncToastIdRef.current = toast.loading('Salvando alterações...');
+      }
+    } else if (syncStatus === 'synced') {
+      if (syncToastIdRef.current) {
+        toast.success('✅ Sincronizado', { id: syncToastIdRef.current, duration: 1800 });
+        syncToastIdRef.current = null;
+      }
+    } else if (syncStatus === 'error') {
+      if (syncToastIdRef.current) {
+        toast.error('⚠️ Falha ao salvar alterações online', { id: syncToastIdRef.current, duration: 2500 });
+        syncToastIdRef.current = null;
+      }
+    }
+  }, [syncStatus, syncQueue.length]);
   const [isFolderTutorialOpen, setIsFolderTutorialOpen] = useState(false);
   
   // Reset modal states
@@ -1949,8 +1994,12 @@ function MainApp() {
         retryCount: 0
       };
       setSyncQueue(prev => [...prev, task]);
+      if (!navigator.onLine) {
+        toast.error('⚠️ Você está offline. As alterações foram salvas localmente.');
+      }
+    } else {
+      toast.success('Lançamento adicionado!');
     }
-    toast.success('Lançamento adicionado!');
   };
 
   const handleUpdateTransaction = async (id: string, data: Partial<Transaction>) => {
@@ -1993,6 +2042,11 @@ function MainApp() {
         retryCount: 0
       };
       setSyncQueue(prev => [...prev, task]);
+      if (!navigator.onLine) {
+        toast.error('⚠️ Você está offline. As alterações foram salvas localmente.');
+      }
+    } else {
+      toast.success('Lançamento atualizado!');
     }
   };
 
@@ -2021,6 +2075,11 @@ function MainApp() {
         };
         setSyncQueue(prev => [...prev, task]);
       }
+      if (!navigator.onLine) {
+        toast.error('⚠️ Você está offline. As alterações foram salvas localmente.');
+      }
+    } else {
+      toast.success('Lançamentos excluídos!');
     }
   };
 
@@ -2382,8 +2441,36 @@ function MainApp() {
           }
         }
 
-        // 2. Check for Local Folder
+        // 2. Check for Local Folder (Fast Login Scenario B / Offline / Connected)
         if (persisted?.workspaceHandle && isFileSystemApiSupported) {
+          try {
+            const permissionStatus = await (persisted.workspaceHandle as any).queryPermission({ mode: 'readwrite' });
+            if (permissionStatus === 'granted') {
+              setFolderHandle(persisted.workspaceHandle);
+              const localProfiles = await syncProfilesFromFolder(persisted.workspaceHandle);
+              const combinedProfiles = mergeProfiles(cloudProfiles, localProfiles);
+              
+              if (combinedProfiles.length > 0) {
+                // Restore last active profile if suitable
+                const lastLocalActive = localStorage.getItem('verdegrana_active_profile');
+                if (lastLocalActive && combinedProfiles.some(p => p.name === lastLocalActive)) {
+                  setActiveProfile(lastLocalActive);
+                  setBootStage('ready');
+                } else if (combinedProfiles.length === 1) {
+                  setActiveProfile(combinedProfiles[0].name);
+                  setBootStage('ready');
+                } else {
+                  setBootStage('profile_select');
+                }
+                toast.success('👋 Bem-vindo de volta! Pasta conectada automaticamente.');
+                await ensureDelay();
+                return;
+              }
+            }
+          } catch (e) {
+            console.warn("Fast login error during permission query:", e);
+          }
+
           setPendingWorkspaceHandle(persisted.workspaceHandle);
           await ensureDelay();
           setBootStage('welcome_back_folder');
@@ -2477,8 +2564,10 @@ function MainApp() {
       }, (payload: any) => {
         console.log('Real-time Channel: Transaction INSERT', payload);
         const newTx = mapCloudTxToLocal(payload.new);
+        let wasAdded = false;
         setTransactions(prev => {
           if (prev.some(t => t.id === newTx.id)) return prev;
+          wasAdded = true;
           const next = [...prev, newTx];
           safeSave('verdegrana_data', next);
           
@@ -2487,14 +2576,31 @@ function MainApp() {
           }
           return next;
         });
-        toast.info(`⚡ Novo lançamento: ${newTx.desc}`, { duration: 2000 });
+        if (wasAdded) {
+          toast.info("🔄 Dados atualizados por outro dispositivo", { duration: 3000 });
+        }
       })
       .on('postgres_changes', { 
         event: 'UPDATE', schema: 'public', table: 'transactions', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
         console.log('Real-time Channel: Transaction UPDATE', payload);
         const updatedTx = mapCloudTxToLocal(payload.new);
+        let wasUpdated = false;
         setTransactions(prev => {
+          const existing = prev.find(t => t.id === updatedTx.id);
+          if (existing) {
+            const hasContentDiff = existing.desc !== updatedTx.desc || 
+                                   existing.value !== updatedTx.value || 
+                                   existing.category !== updatedTx.category || 
+                                   existing.status !== updatedTx.status ||
+                                   existing.type !== updatedTx.type ||
+                                   existing.date !== updatedTx.date;
+            if (hasContentDiff) {
+              wasUpdated = true;
+            }
+          } else {
+            wasUpdated = true;
+          }
           const next = prev.map(t => t.id === updatedTx.id ? updatedTx : t);
           safeSave('verdegrana_data', next);
           
@@ -2503,23 +2609,33 @@ function MainApp() {
           }
           return next;
         });
+        if (wasUpdated) {
+          toast.info("🔄 Dados atualizados por outro dispositivo", { duration: 3000 });
+        }
       })
       .on('postgres_changes', { 
         event: 'DELETE', schema: 'public', table: 'transactions', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
         console.log('Real-time Channel: Transaction DELETE', payload);
-        const deletedId = payload.old.id;
+        const deletedId = String(payload.old.id);
+        let wasDeleted = false;
         setTransactions(prev => {
           const deletedTx = prev.find(t => t.id === deletedId);
+          if (deletedTx) {
+            wasDeleted = true;
+          }
           const deletedTxProfile = deletedTx?.profile_name;
           const next = prev.filter(t => t.id !== deletedId);
-          localStorage.setItem('verdegrana_data', JSON.stringify(next));
+          safeSave('verdegrana_data', next);
           
           if (folderHandle && deletedTxProfile) {
              saveToFolder(deletedTxProfile, next, categories);
           }
           return next;
         });
+        if (wasDeleted) {
+          toast.info("🔄 Dados atualizados por outro dispositivo", { duration: 3000 });
+        }
       })
       .on('postgres_changes', { 
         event: 'INSERT', schema: 'public', table: 'audit_logs', filter: `user_id=eq.${user.id}` 
@@ -2604,34 +2720,7 @@ function MainApp() {
     };
   }, [isCloudMode, user, supabase]);
 
-  // Auto-sync on visibility change (coming back to tab)
-  useEffect(() => {
-    if (!isCloudMode || !user) return;
-    
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        console.log("Tab focus detected. Refreshing cloud data...");
-        fetchCloudData(user.id);
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [isCloudMode, user]);
-
-  // Periodic Background Polling as WebSocket fallback
-  useEffect(() => {
-    if (!isCloudMode || !user || !supabase) return;
-
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible' && navigator.onLine) {
-        console.log("Periodic background poll: Fetching cloud data...");
-        fetchCloudData(user.id);
-      }
-    }, 6000); // 6 seconds poll period for immediate reactivity
-
-    return () => clearInterval(interval);
-  }, [isCloudMode, user]);
+  // Purely event-driven through Supabase Realtime changes and local triggers. All active polling or timed sync interval triggers are decommissioned.
   useEffect(() => {
     if (bootStage !== 'ready') return;
     if (folderHandle) {
