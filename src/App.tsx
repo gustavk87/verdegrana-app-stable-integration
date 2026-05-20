@@ -762,6 +762,7 @@ function MainApp() {
       }
     })();
   const [bootStage, setBootStage] = useState<BootStage>('splash');
+  const [isBooting, setIsBooting] = useState(true);
   const [rescueProfile, setRescueProfile] = useState<ProfileInfo | null>(null);
   const [user, setUser] = useState<any>(null);
   const [isCloudMode, setIsCloudMode] = useState(false);
@@ -1098,26 +1099,8 @@ function MainApp() {
     }
   }, [syncQueue.length, syncStatus, processSyncQueue]);
 
-  // 4. Premium Toast Status Notification Manager
+  // 4. Premium Toast Status Notification Manager has been decommissioned to prevent popup spam. The visual sync indicator handles status feedback.
   const syncToastIdRef = useRef<any>(null);
-
-  useEffect(() => {
-    if (syncStatus === 'saving' && syncQueue.length > 0) {
-      if (!syncToastIdRef.current) {
-        syncToastIdRef.current = toast.loading('Salvando alterações...');
-      }
-    } else if (syncStatus === 'synced') {
-      if (syncToastIdRef.current) {
-        toast.success('✅ Sincronizado', { id: syncToastIdRef.current, duration: 1800 });
-        syncToastIdRef.current = null;
-      }
-    } else if (syncStatus === 'error') {
-      if (syncToastIdRef.current) {
-        toast.error('⚠️ Falha ao salvar alterações online', { id: syncToastIdRef.current, duration: 2500 });
-        syncToastIdRef.current = null;
-      }
-    }
-  }, [syncStatus, syncQueue.length]);
   const [isFolderTutorialOpen, setIsFolderTutorialOpen] = useState(false);
   
   // Reset modal states
@@ -1922,11 +1905,14 @@ function MainApp() {
   };
 
   const logAudit = useCallback((operation: AuditLog['operation'], profile: string, desc: string, value?: number) => {
+    const targetProfile = profile || activeProfile;
+    if (!targetProfile) return;
+    
     const newLog: AuditLog = {
       id: crypto.randomUUID(),
       timestamp: new Date().toISOString(),
       operation,
-      metadata: { profile, description: desc, value }
+      metadata: { profile: targetProfile, description: desc, value }
     };
     
     setAuditLogs(prev => {
@@ -1950,7 +1936,7 @@ function MainApp() {
       };
       setSyncQueue(prev => [...prev, task]);
     }
-  }, [isCloudMode, user, supabase, activeProfile, clientId]);
+  }, [isCloudMode, user, supabase, activeProfile, clientId, safeSave]);
 
   const handleAddTransaction = async (data: any) => {
     const newId = data.id || crypto.randomUUID();
@@ -2237,38 +2223,42 @@ function MainApp() {
   };
 
   const handleClearAuditLogs = async () => {
-    setAuditLogs([]);
-    localStorage.removeItem('verdegrana_audit_trail');
+    if (!activeProfile) return;
+    const nextLogs = auditLogs.filter(log => log.metadata?.profile !== activeProfile);
+    setAuditLogs(nextLogs);
+    localStorage.setItem('verdegrana_audit_trail', JSON.stringify(nextLogs));
     
     if (isCloudMode && user && supabase) {
       setSyncStatus('saving');
-      const { error } = await supabase.from('audit_logs').delete().eq('user_id', user.id);
+      const { error } = await supabase.from('audit_logs').delete().eq('user_id', user.id).eq('metadata->profile', activeProfile);
       if (error) {
         console.error("Erro ao limpar logs na nuvem:", error);
         setSyncStatus('error');
       } else {
         setSyncStatus('synced');
-        toast.success('Histórico limpo na nuvem.');
+        toast.success(`Histórico do perfil '${activeProfile}' limpo na nuvem.`);
         
-        // Also clear auditLogs in userdata fallback
+        // Also clear active profile logs in userdata fallback if any
         supabase.from('userdata').select('data').eq('user_id', user.id).single()
           .then(({ data: ud }) => {
             if (ud?.data) {
               const newData = { ...ud.data };
-              delete newData.auditLogs;
-              supabase.from('userdata').update({ data: newData }).eq('user_id', user.id);
+              if (Array.isArray(newData.auditLogs)) {
+                newData.auditLogs = newData.auditLogs.filter((log: any) => log.metadata?.profile !== activeProfile);
+                supabase.from('userdata').update({ data: newData }).eq('user_id', user.id);
+              }
             }
           });
 
         // Notify other devices
-        supabase.channel('verdegrana_sync').send({
+        supabase.channel(`verdegrana_all_${user.id}`).send({
           type: 'broadcast',
           event: 'sync',
-          payload: { userId: user.id, clientId, type: 'logs_clear' }
+          payload: { userId: user.id, clientId, type: 'logs_clear', profile: activeProfile }
         });
       }
     } else {
-      toast.success('Histórico local limpo.');
+      toast.success(`Histórico local do perfil '${activeProfile}' limpo.`);
     }
   };
 
@@ -2411,6 +2401,11 @@ function MainApp() {
   useEffect(() => {
     const boot = async () => {
       const startTime = Date.now();
+      const ensureDelay = async () => {
+        const elapsed = Date.now() - startTime;
+        if (elapsed < 800) await delay(800 - elapsed);
+      };
+
       try {
         // Recovery logic...
         try {
@@ -2424,11 +2419,6 @@ function MainApp() {
 
         const db = await initDB();
         const persisted = await getState(db);
-
-        const ensureDelay = async () => {
-          const elapsed = Date.now() - startTime;
-          if (elapsed < 800) await delay(800 - elapsed);
-        };
 
         // 1. Check for Cloud Session
         let cloudProfiles: ProfileInfo[] = [];
@@ -2464,6 +2454,7 @@ function MainApp() {
                 }
                 toast.success('👋 Bem-vindo de volta! Pasta conectada automaticamente.');
                 await ensureDelay();
+                setIsBooting(false);
                 return;
               }
             }
@@ -2474,14 +2465,27 @@ function MainApp() {
           setPendingWorkspaceHandle(persisted.workspaceHandle);
           await ensureDelay();
           setBootStage('welcome_back_folder');
+          setIsBooting(false);
           return;
         }
 
         const combinedProfiles = mergeProfiles(cloudProfiles, []);
         
         if (combinedProfiles.length > 0) {
+          const lastLocalActive = localStorage.getItem('verdegrana_active_profile');
+          if (lastLocalActive && combinedProfiles.some(p => p.name === lastLocalActive)) {
+            setActiveProfile(lastLocalActive);
+            setBootStage('ready');
+            toast.success(`👋 Bem-vindo de volta, ${lastLocalActive}!`);
+          } else if (combinedProfiles.length === 1) {
+            setActiveProfile(combinedProfiles[0].name);
+            setBootStage('ready');
+            toast.success(`👋 Bem-vindo, ${combinedProfiles[0].name}!`);
+          } else {
+            setBootStage('profile_select');
+          }
           await ensureDelay();
-          setBootStage('profile_select');
+          setIsBooting(false);
           return;
         }
 
@@ -2496,18 +2500,27 @@ function MainApp() {
         }
 
         await ensureDelay();
-        setBootStage('splash');
+        if (supabase && (await supabase.auth.getSession()).data.session) {
+          // Logged in but has no profiles
+          setBootStage('welcome');
+        } else {
+          // Not logged in / guest
+          setBootStage('presentation');
+        }
+        setIsBooting(false);
       } catch (e) {
         console.error("Erro no boot:", e);
-        await delay(800);
-        setBootStage('splash');
+        await ensureDelay();
+        setBootStage('presentation');
+        setIsBooting(false);
       }
     };
     
     // Auth change listener
+    let subscription: any = null;
     if (supabase) {
       let isProcessingLogout = false;
-      supabase.auth.onAuthStateChange(async (event: any, session: any) => {
+      const { data } = supabase.auth.onAuthStateChange(async (event: any, session: any) => {
         if (event === 'SIGNED_OUT') {
           if (!isProcessingLogout) {
             isProcessingLogout = true;
@@ -2515,6 +2528,10 @@ function MainApp() {
             isProcessingLogout = false;
           }
         } else if (session?.user) {
+          // Disable immediate profile routing on mount to let boot() manage initial screen.
+          const isCurrentlyBooting = isBooting;
+          if (isCurrentlyBooting) return;
+
           setUser(session.user);
           setIsCloudMode(true);
           syncProfilesFromCloud(session.user.id).then((profiles) => {
@@ -2523,10 +2540,17 @@ function MainApp() {
           });
         }
       });
+      subscription = data.subscription;
     }
 
     boot();
-  }, []);
+
+    return () => {
+      if (subscription) {
+        subscription.unsubscribe();
+      }
+    };
+  }, [isBooting]);
 
   const mapCloudTxToLocal = (t: any): Transaction => {
     const val = Number(t.value || t.amount) || 0;
@@ -2553,7 +2577,7 @@ function MainApp() {
     if (!supabase || !isCloudMode || !user) return;
 
     // Unified Real-time Channel (Transactions, Audit Logs, Metadata, Broadcasts)
-    const channel = supabase.channel(`verdegrana_all_${user.id}`, {
+    const channel = supabase.channel('custom-all-channel', {
       config: {
         broadcast: { self: false },
         presence: { key: user.id }
@@ -2564,10 +2588,8 @@ function MainApp() {
       }, (payload: any) => {
         console.log('Real-time Channel: Transaction INSERT', payload);
         const newTx = mapCloudTxToLocal(payload.new);
-        let wasAdded = false;
         setTransactions(prev => {
           if (prev.some(t => t.id === newTx.id)) return prev;
-          wasAdded = true;
           const next = [...prev, newTx];
           safeSave('verdegrana_data', next);
           
@@ -2576,31 +2598,13 @@ function MainApp() {
           }
           return next;
         });
-        if (wasAdded) {
-          toast.info("🔄 Dados atualizados por outro dispositivo", { duration: 3000 });
-        }
       })
       .on('postgres_changes', { 
         event: 'UPDATE', schema: 'public', table: 'transactions', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
         console.log('Real-time Channel: Transaction UPDATE', payload);
         const updatedTx = mapCloudTxToLocal(payload.new);
-        let wasUpdated = false;
         setTransactions(prev => {
-          const existing = prev.find(t => t.id === updatedTx.id);
-          if (existing) {
-            const hasContentDiff = existing.desc !== updatedTx.desc || 
-                                   existing.value !== updatedTx.value || 
-                                   existing.category !== updatedTx.category || 
-                                   existing.status !== updatedTx.status ||
-                                   existing.type !== updatedTx.type ||
-                                   existing.date !== updatedTx.date;
-            if (hasContentDiff) {
-              wasUpdated = true;
-            }
-          } else {
-            wasUpdated = true;
-          }
           const next = prev.map(t => t.id === updatedTx.id ? updatedTx : t);
           safeSave('verdegrana_data', next);
           
@@ -2609,21 +2613,14 @@ function MainApp() {
           }
           return next;
         });
-        if (wasUpdated) {
-          toast.info("🔄 Dados atualizados por outro dispositivo", { duration: 3000 });
-        }
       })
       .on('postgres_changes', { 
         event: 'DELETE', schema: 'public', table: 'transactions', filter: `user_id=eq.${user.id}` 
       }, (payload: any) => {
         console.log('Real-time Channel: Transaction DELETE', payload);
         const deletedId = String(payload.old.id);
-        let wasDeleted = false;
         setTransactions(prev => {
           const deletedTx = prev.find(t => t.id === deletedId);
-          if (deletedTx) {
-            wasDeleted = true;
-          }
           const deletedTxProfile = deletedTx?.profile_name;
           const next = prev.filter(t => t.id !== deletedId);
           safeSave('verdegrana_data', next);
@@ -2633,9 +2630,6 @@ function MainApp() {
           }
           return next;
         });
-        if (wasDeleted) {
-          toast.info("🔄 Dados atualizados por outro dispositivo", { duration: 3000 });
-        }
       })
       .on('postgres_changes', { 
         event: 'INSERT', schema: 'public', table: 'audit_logs', filter: `user_id=eq.${user.id}` 
@@ -3181,6 +3175,41 @@ function MainApp() {
 
   // --- UI Renders ---
 
+  if (isBooting) {
+    return (
+      <div className="h-screen w-screen bg-slate-950 flex flex-col items-center justify-center overflow-hidden p-6 select-none">
+        <motion.div 
+          initial={{ opacity: 0 }} 
+          animate={{ opacity: 1 }} 
+          className="flex-1 flex flex-col items-center justify-center space-y-10 relative"
+        >
+          <div className="p-8 bg-emerald-500 rounded-[2.5rem] w-fit mx-auto shadow-2xl shadow-emerald-500/40 relative">
+            <Leaf className="w-16 h-16 text-white animate-pulse" />
+          </div>
+          <div className="space-y-4 text-center">
+            <h1 className="text-5xl font-black text-white tracking-tighter uppercase leading-none">VerdeGrana</h1>
+            <p className="text-slate-500 font-mono text-[9px] uppercase tracking-[0.3em]">Financeiro Inteligente</p>
+          </div>
+        </motion.div>
+        
+        <div className="w-full max-w-xs text-center pb-12">
+          <div className="w-24 h-1 bg-white/5 rounded-full overflow-hidden border border-white/5 mx-auto mb-4 relative">
+             <motion.div 
+               className="h-full bg-emerald-500 rounded-full" 
+               initial={{ left: "-40%", width: "40%" }}
+               animate={{ left: "100%" }}
+               transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }}
+               style={{ position: "absolute" }}
+             />
+          </div>
+          <p className="text-[10px] text-slate-600 font-bold uppercase tracking-[0.25em] leading-relaxed animate-pulse">
+            Sincronizando ambiente...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   // Module 1: Silent Boot - Loading Overlay
   if (bootStage === 'syncing') {
     return (
@@ -3630,8 +3659,14 @@ function MainApp() {
                     setRescueProfile(p);
                     return;
                   }
+                  setBootStage('syncing');
+                  const startSel = Date.now();
                   setActiveProfile(p.name);
                   await loadProfileData(p.name);
+                  const elapsedSel = Date.now() - startSel;
+                  if (elapsedSel < 800) {
+                    await delay(800 - elapsedSel);
+                  }
                   setBootStage('ready');
                   toast.success(`Bem-vindo, ${p.name}!`);
                 }}
@@ -3673,8 +3708,14 @@ function MainApp() {
                     return;
                   }
                   
+                  setBootStage('syncing');
+                  const startNew = Date.now();
                   if (isCloudMode && user && supabase) {
                     await supabase.from('profiles').insert([{ name: cleanName, user_id: user.id }]);
+                  }
+                  const elapsedNew = Date.now() - startNew;
+                  if (elapsedNew < 800) {
+                    await delay(800 - elapsedNew);
                   }
                   
                   setProfilesList(prev => [...prev, { name: cleanName, source: isCloudMode ? 'cloud' : 'local' }]);
@@ -3725,6 +3766,8 @@ function MainApp() {
                       onClick={async () => {
                         const pName = rescueProfile.name;
                         try {
+                          setBootStage('syncing');
+                          const startRescue = Date.now();
                           if (isFileSystemApiSupported) {
                             // @ts-ignore
                             const handle = await window.showDirectoryPicker();
@@ -3736,11 +3779,18 @@ function MainApp() {
                           
                           setActiveProfile(pName);
                           await loadProfileData(pName);
+                          const elapsedRescue = Date.now() - startRescue;
+                          if (elapsedRescue < 800) {
+                            await delay(800 - elapsedRescue);
+                          }
                           setRescueProfile(null);
                           setBootStage('ready');
                           toast.success(isFileSystemApiSupported ? 'Perfil resgatado com sucesso!' : 'Perfil ativado em modo nuvem com sucesso!');
                         } catch (e: any) {
-                          if (e.name === 'AbortError') return;
+                          if (e.name === 'AbortError') {
+                            setBootStage('profile_select');
+                            return;
+                          }
                           console.error("Erro fatal no resgate:", e);
                           toast.error("Falha no resgate dos dados. Verifique sua conexão ou a pasta selecionada.");
                           setBootStage('profile_select');
@@ -4366,10 +4416,14 @@ function MainApp() {
                   </div>
 
                   <div className="space-y-3">
-                    {auditLogs.length === 0 ? (
-                      <div className="py-20 text-center text-slate-500 font-bold uppercase tracking-widest text-[10px]">Tudo limpo por aqui. Nenhuma ação registrada.</div>
-                    ) : (
-                      auditLogs.map(log => (
+                    {(() => {
+                      const filteredLogs = auditLogs.filter(log => log.metadata?.profile === activeProfile);
+                      if (filteredLogs.length === 0) {
+                        return (
+                          <div className="py-20 text-center text-slate-500 font-bold uppercase tracking-widest text-[10px]">Tudo limpo por aqui. Nenhuma ação registrada.</div>
+                        );
+                      }
+                      return filteredLogs.map(log => (
                         <div key={log.id} className="flex items-center justify-between p-4 bg-white/2 rounded-2xl border border-white/5">
                           <div className="flex items-center gap-4">
                             <div className={cn(
@@ -4400,8 +4454,8 @@ function MainApp() {
                              </p>
                           </div>
                         </div>
-                      ))
-                    )}
+                      ));
+                    })()}
                   </div>
                 </div>
               </motion.div>
