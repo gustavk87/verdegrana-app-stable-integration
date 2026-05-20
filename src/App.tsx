@@ -53,7 +53,12 @@ import {
   History,
   Coins,
   CornerDownRight,
-  AlertTriangle
+  AlertTriangle,
+  Info,
+  ChevronDown,
+  Mic,
+  Save,
+  MessageSquare
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
@@ -163,6 +168,9 @@ interface AuditLog {
     value?: number;
     profile: string;
     description: string;
+    old_data?: any;
+    new_data?: any;
+    tx_id?: string;
   };
 }
 
@@ -944,7 +952,10 @@ function MainApp() {
 
   // UI States
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
+  const [previewData, setPreviewData] = useState<any[]>([]);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
+  const [expandedAuditLogId, setExpandedAuditLogId] = useState<string | null>(null);
   const [parentSearch, setParentSearch] = useState('');
   const [isAnexo, setIsAnexo] = useState(false);
   const [selectedParentId, setSelectedParentId] = useState<string>('');
@@ -1024,7 +1035,7 @@ function MainApp() {
 
           if (!error) {
             successes.push(task.id);
-            supabase.channel('verdegrana_sync').send({
+            supabase.channel(`verdegrana_sync_${user.id}`).send({
               type: 'broadcast',
               event: 'sync',
               payload: { userId: user.id, clientId, type: task.type }
@@ -1281,7 +1292,7 @@ function MainApp() {
     return Array.from(map.values());
   };
 
-  const loadProfileData = async (profileName: string) => {
+  const loadProfileData = async (profileName: string, preferCloud: boolean = false) => {
     if (!profileName) return;
     setSyncStatus('saving');
     
@@ -1321,6 +1332,23 @@ function MainApp() {
           const ts = t ? new Date(t).getTime() : 0;
           return Math.max(max, ts);
         }, 0);
+
+        // AUTO-RESOLVE TO CLOUD IF REQUESTED (Force Cloud on Startup)
+        if (preferCloud) {
+           setTransactions((prev: Transaction[]) => {
+            const otherProfiles = prev.filter(t => t.profile_name !== profileName.trim());
+            const next = [...otherProfiles, ...cloudTxsForProfile];
+            setHistory([next]);
+            setHistoryPointer(0);
+            return next;
+          });
+          if (folderHandle) {
+            await saveToFolder(profileName.trim(), cloudTxsForProfile, categories);
+          }
+          setSyncStatus('synced');
+          console.log(`[Sync] Cloud authoritative sync applied for ${profileName}`);
+          return;
+        }
 
         const timeDiff = Math.abs(maxCloudUpdatedAt - localModifiedTime);
         const countDiff = cloudTxsForProfile.length !== localTxsForProfile.length;
@@ -1499,7 +1527,7 @@ function MainApp() {
         }
         setSyncStatus('synced');
         // Notify other devices
-        supabase.channel('verdegrana_sync').send({
+        supabase.channel(`verdegrana_sync_${user.id}`).send({
           type: 'broadcast',
           event: 'sync',
           payload: { userId: user.id, clientId, type: 'undo' }
@@ -1551,7 +1579,7 @@ function MainApp() {
         }
         setSyncStatus('synced');
         // Notify other devices
-        supabase.channel('verdegrana_sync').send({
+        supabase.channel(`verdegrana_sync_${user.id}`).send({
           type: 'broadcast',
           event: 'sync',
           payload: { userId: user.id, clientId, type: 'redo' }
@@ -1904,7 +1932,15 @@ function MainApp() {
     }
   };
 
-  const logAudit = useCallback((operation: AuditLog['operation'], profile: string, desc: string, value?: number) => {
+  const logAudit = useCallback((
+    operation: AuditLog['operation'],
+    profile: string,
+    desc: string,
+    value?: number,
+    old_data?: any,
+    new_data?: any,
+    tx_id?: string
+  ) => {
     const targetProfile = profile || activeProfile;
     if (!targetProfile) return;
     
@@ -1912,7 +1948,14 @@ function MainApp() {
       id: crypto.randomUUID(),
       timestamp: new Date().toISOString(),
       operation,
-      metadata: { profile: targetProfile, description: desc, value }
+      metadata: {
+        profile: targetProfile,
+        description: desc,
+        value,
+        old_data,
+        new_data,
+        tx_id
+      }
     };
     
     setAuditLogs(prev => {
@@ -1938,6 +1981,54 @@ function MainApp() {
     }
   }, [isCloudMode, user, supabase, activeProfile, clientId, safeSave]);
 
+  const handleRevertAudit = async (log: AuditLog) => {
+    try {
+      const { operation, metadata } = log;
+      const { tx_id, old_data } = metadata;
+      
+      if (operation === 'Inserção' && tx_id) {
+        const exists = transactions.some(t => t.id === tx_id);
+        if (!exists) {
+          toast.warning('A transação associada a este log já não existe!');
+          return;
+        }
+        await handleDeleteTransactions([tx_id]);
+        toast.success('Inserção revertida: transação excluída com sucesso.');
+        logAudit('Desfazer', activeProfile, `Desfeita Inserção de '${metadata.description}'`, metadata.value);
+      } 
+      else if (operation === 'Edição' && tx_id && old_data) {
+        const exists = transactions.some(t => t.id === tx_id);
+        if (!exists) {
+          toast.warning('A transação editada já não existe!');
+          return;
+        }
+        await handleUpdateTransaction(tx_id, old_data);
+        toast.success('Edição revertida: valores anteriores restaurados.');
+        logAudit('Desfazer', activeProfile, `Desfeita Edição de '${metadata.description}'`, metadata.value);
+      } 
+      else if (operation === 'Exclusão' && old_data) {
+        const deletedTxs = Array.isArray(old_data) ? old_data : [old_data];
+        if (deletedTxs.length === 0) {
+          toast.warning('Nenhum dado salvo para restaurar!');
+          return;
+        }
+        
+        for (const tx of deletedTxs) {
+          if (!transactions.some(t => t.id === tx.id)) {
+            await handleAddTransaction(tx);
+          }
+        }
+        toast.success(`Exclusão revertida: ${deletedTxs.length} transações restauradas.`);
+        logAudit('Desfazer', activeProfile, `Desfeita Exclusão de ${deletedTxs.length} registros`, undefined);
+      } else {
+        toast.warning('Esta operação não suporta reversão automática ou os dados estão incompletos.');
+      }
+    } catch (e) {
+      console.error('Erro ao reverter operação:', e);
+      toast.error('Ocorreu um erro ao tentar reverter a operação.');
+    }
+  };
+
   const handleAddTransaction = async (data: any) => {
     const newId = data.id || crypto.randomUUID();
     const newTx: Transaction = { 
@@ -1956,7 +2047,7 @@ function MainApp() {
       return next;
     });
 
-    logAudit('Inserção', activeProfile, data.desc || data.description, data.value || data.amount);
+    logAudit('Inserção', activeProfile, data.desc || data.description, data.value || data.amount, null, newTx, newId);
 
     if (isCloudMode && user && supabase) {
       const task: SyncTask = {
@@ -1989,21 +2080,19 @@ function MainApp() {
   };
 
   const handleUpdateTransaction = async (id: string, data: Partial<Transaction>) => {
-    let oldDesc = '';
-    let oldValue = 0;
+    const tx = transactions.find(t => t.id === id);
+    const oldTx = tx ? { ...tx } : null;
+    const newTx = tx ? { ...tx, ...data } : null;
+    const oldDesc = tx ? tx.desc : '';
+    const oldValue = tx ? tx.value : 0;
     
     setTransactions(prev => {
-      const tx = prev.find(t => t.id === id);
-      if (tx) {
-        oldDesc = tx.desc;
-        oldValue = tx.value;
-      }
       const next = prev.map(t => t.id === id ? { ...t, ...data, updatedAt: new Date().toISOString() } : t);
       pushToHistory(next);
       return next;
     });
 
-    logAudit('Edição', activeProfile, data.desc || oldDesc, data.value || oldValue);
+    logAudit('Edição', activeProfile, data.desc || oldDesc, data.value !== undefined ? data.value : oldValue, oldTx, newTx, id);
 
     if (isCloudMode && user && supabase) {
       const updatePayload: any = { updated_at: new Date().toISOString() };
@@ -2037,18 +2126,17 @@ function MainApp() {
   };
 
   const handleDeleteTransactions = async (ids: string[]) => {
-    let deletedCount = ids.length;
-    let profiles: string[] = [];
+    const deletedCount = ids.length;
+    const toDelete = transactions.filter(t => ids.includes(t.id));
+    const profiles = Array.from(new Set(toDelete.map(t => t.profile_name)));
     
     setTransactions(prev => {
-      const toDelete = prev.filter(t => ids.includes(t.id));
-      profiles = Array.from(new Set(toDelete.map(t => t.profile_name)));
       const next = prev.filter(t => !ids.includes(t.id));
       pushToHistory(next);
       return next;
     });
 
-    logAudit('Exclusão', profiles.join(', '), `Exclusão de ${deletedCount} registros`);
+    logAudit('Exclusão', profiles.join(', '), `Exclusão de ${deletedCount} registros`, undefined, toDelete, null, ids.join(','));
 
     if (isCloudMode && user && supabase) {
       const validIds = ids.filter(isUUID);
@@ -2251,7 +2339,7 @@ function MainApp() {
           });
 
         // Notify other devices
-        supabase.channel(`verdegrana_all_${user.id}`).send({
+        supabase.channel(`verdegrana_sync_${user.id}`).send({
           type: 'broadcast',
           event: 'sync',
           payload: { userId: user.id, clientId, type: 'logs_clear', profile: activeProfile }
@@ -2445,9 +2533,11 @@ function MainApp() {
                 const lastLocalActive = localStorage.getItem('verdegrana_active_profile');
                 if (lastLocalActive && combinedProfiles.some(p => p.name === lastLocalActive)) {
                   setActiveProfile(lastLocalActive);
+                  await loadProfileData(lastLocalActive, true);
                   setBootStage('ready');
                 } else if (combinedProfiles.length === 1) {
                   setActiveProfile(combinedProfiles[0].name);
+                  await loadProfileData(combinedProfiles[0].name, true);
                   setBootStage('ready');
                 } else {
                   setBootStage('profile_select');
@@ -2475,10 +2565,12 @@ function MainApp() {
           const lastLocalActive = localStorage.getItem('verdegrana_active_profile');
           if (lastLocalActive && combinedProfiles.some(p => p.name === lastLocalActive)) {
             setActiveProfile(lastLocalActive);
+            await loadProfileData(lastLocalActive, false);
             setBootStage('ready');
             toast.success(`👋 Bem-vindo de volta, ${lastLocalActive}!`);
           } else if (combinedProfiles.length === 1) {
             setActiveProfile(combinedProfiles[0].name);
+            await loadProfileData(combinedProfiles[0].name, false);
             setBootStage('ready');
             toast.success(`👋 Bem-vindo, ${combinedProfiles[0].name}!`);
           } else {
@@ -2577,7 +2669,7 @@ function MainApp() {
     if (!supabase || !isCloudMode || !user) return;
 
     // Unified Real-time Channel (Transactions, Audit Logs, Metadata, Broadcasts)
-    const channel = supabase.channel('custom-all-channel', {
+    const channel = supabase.channel(`verdegrana_sync_${user.id}`, {
       config: {
         broadcast: { self: false },
         presence: { key: user.id }
@@ -2764,170 +2856,148 @@ function MainApp() {
   }, [transactions, categories, profilesList, folderHandle]);
 
   // --- Handlers ---
-  const processImport = useCallback((data: any[]) => {
-    if (!Array.isArray(data)) {
-      toast.error('Formato de dados inválido.');
+  const [aiSummary, setAiSummary] = useState('');
+
+  const processImport = useCallback((raw: any) => {
+    let txs: any[] = [];
+    let summary = '';
+
+    if (Array.isArray(raw)) {
+      txs = raw;
+      summary = 'Dados brutos detectados. Verifique se as relações de subconta estão corretas.';
+    } else if (raw && typeof raw === 'object') {
+      txs = raw.transactions || (Array.isArray(raw) ? raw : []);
+      summary = raw.user_friendly_summary || 'Nenhum resumo fornecido pela IA.';
+    }
+
+    if (txs.length === 0 && !summary) {
+      toast.error('Nenhum dado válido processado.');
       return;
     }
 
-    const newCategories: Category[] = [...categories];
-    let createdCount = 0;
-    let mergedCount = 0;
-    let categoryCount = 0;
-    
-    const batchTxs: Transaction[] = [];
-    
-    data.forEach(item => {
-      // Auto-Category Registration
-      const catName = item.category || 'Outros';
-      const catExists = newCategories.find(c => c.name.toLowerCase() === catName.toLowerCase());
-      
-      if (!catExists) {
-        const newCat = { 
-          id: catName.toLowerCase(), 
-          name: catName,
-          color: `#${Math.floor(Math.random()*16777215).toString(16)}` 
-        };
-        newCategories.push(newCat);
-        categoryCount++;
-      }
-
-      // 1. Robust Parent Matching (Desc trimmed/lowercase + Date + Profile)
-      const itemDescClean = (item.desc || item.description || "").toLowerCase().trim();
-      const existingParent = [...transactions, ...batchTxs].find(t => 
-        t.date === item.date && 
-        (t.desc || "").toLowerCase().trim() === itemDescClean &&
-        (t.profile_name) === activeProfile &&
-        !t.parent_id // Match against top-level parents only
-      );
-
-      let mainTxId: string;
-      if (existingParent) {
-        mainTxId = existingParent.id;
-        mergedCount++;
-      } else {
-        // Create new Parent
-        mainTxId = crypto.randomUUID();
-        const parentTx: Transaction = {
-          id: mainTxId,
-          date: item.date,
-          desc: item.desc || item.description,
-          value: item.value || item.amount,
-          category: item.category || 'Outros',
-          type: item.type,
-          profile_name: activeProfile,
-          status: item.status || 'realizado',
-          is_redutora: item.is_redutora || false,
-          parent_id: item.parent_id || null,
-          parent_name: item.parent_name || null,
-          updatedAt: new Date().toISOString()
-        };
-        batchTxs.push(parentTx);
-        createdCount++;
-      }
-
-      // Process children (deductions and additions) with local deduplication
-      const processSubItems = (subItems: any[], isRedutora: boolean) => {
-        if (!Array.isArray(subItems)) return;
-        
-        subItems.forEach((sub: any) => {
-          const subDesc = sub.description || sub.desc || (isRedutora ? `Desconto: ${item.desc}` : `Acréscimo: ${item.desc}`);
-          const subDescClean = subDesc.toLowerCase().trim();
-
-          // Check if this child already exists under THIS parent ID
-          const subExists = [...transactions, ...batchTxs].some(t => 
-            t.parent_id === mainTxId && 
-            (t.desc || "").toLowerCase().trim() === subDescClean
-          );
-
-          if (!subExists) {
-            const childTx: Transaction = {
-              id: crypto.randomUUID(),
-              date: item.date,
-              desc: subDesc,
-              value: sub.amount || sub.value,
-              category: sub.category || item.category || 'Outros',
-              type: item.type,
-              profile_name: activeProfile,
-              status: item.status || 'realizado',
-              is_redutora: isRedutora,
-              parent_id: mainTxId,
-              parent_name: item.desc || item.description || null,
-              updatedAt: new Date().toISOString()
-            };
-            batchTxs.push(childTx);
-            createdCount++;
-          }
-        });
+    // Enriching preview data with unique temp IDs and stable IDs for referencing
+    const enriched = txs.map(t => {
+      const id = t.id || crypto.randomUUID();
+      return {
+        ...t,
+        id,
+        tempId: crypto.randomUUID(),
+        parent_id: t.parent_id || null,
       };
-
-      processSubItems(item.deductions, true);
-      processSubItems(item.additions, false);
     });
 
-    // Bulk state update
-    if (batchTxs.length > 0) {
-      setTransactions(prev => {
-        const txMap = new Map<string, Transaction>();
-        prev.forEach(t => txMap.set(t.id, t));
-        batchTxs.forEach(t => txMap.set(t.id, t));
-        const next = Array.from(txMap.values());
-        pushToHistory(next);
-        return next;
-      });
+    setPreviewData(enriched);
+    setAiSummary(summary);
+    setIsPreviewModalOpen(true);
+  }, []);
 
-      // Audit log for AI import
-      const summary = `Importação IA: ${createdCount} novos, ${mergedCount} vinculados`;
-      logAudit('Inserção', activeProfile, summary);
+  const confirmImport = useCallback(async (verifiedData: any[]) => {
+    const nextTransactions = [...transactions];
+    const newCategories: Category[] = [...categories];
+    let createdCount = 0;
+    let updatedCount = 0;
+    let deletedCount = 0;
 
-      // Bulk cloud sync
-      if (isCloudMode && user && supabase) {
-        setSyncStatus('saving');
-        supabase.from('transactions').insert(batchTxs.map(t => ({
-          id: t.id,
-          user_id: user.id,
-          date: t.date,
-          description: t.desc,
-          category: t.category,
-          type: t.type,
-          amount: t.value,
-          profile_name: t.profile_name,
-          status: t.status,
-          is_redutora: t.is_redutora,
-          parent_id: (t.parent_id && isUUID(t.parent_id)) ? t.parent_id : null,
-          parent_name: t.parent_name || null,
-          updated_at: t.updatedAt
-        }))).then(({ error }: { error: any }) => {
-          if (error) {
-            console.error("Erro na sincronização em lote (AI/Import):", error);
-            setSyncStatus('error');
-            toast.error("Erro ao sincronizar lote: " + error.message);
-          } else {
-            setSyncStatus('synced');
-            // Notify other devices
-            supabase.channel('verdegrana_sync').send({
-              type: 'broadcast',
-              event: 'sync',
-              payload: { userId: user.id, clientId, type: 'ai_import' }
-            });
-          }
+    // Sort to process parents first
+    const sortedData = [...verifiedData].sort((a, b) => {
+      const aChild = a.parent_id || a.parent_name;
+      const bChild = b.parent_id || b.parent_name;
+      if (!aChild && bChild) return -1;
+      if (aChild && !bChild) return 1;
+      return 0;
+    });
+
+    sortedData.forEach(item => {
+      if (item.operation === 'delete') {
+        const idx = nextTransactions.findIndex(t => t.id === item.id);
+        if (idx !== -1) {
+          nextTransactions.splice(idx, 1);
+          deletedCount++;
+        }
+        return;
+      }
+
+      if (item.operation === 'update') {
+        const idx = nextTransactions.findIndex(t => t.id === item.id);
+        if (idx !== -1) {
+          nextTransactions[idx] = { ...nextTransactions[idx], ...item, updatedAt: new Date().toISOString() };
+          updatedCount++;
+        }
+        return;
+      }
+
+      // Category registration
+      const catName = item.category || 'Outros';
+      const catExists = newCategories.find(c => c.name.toLowerCase() === catName.toLowerCase());
+      if (!catExists) {
+        newCategories.push({
+          id: catName.toLowerCase(),
+          name: catName,
+          color: `#${Math.floor(Math.random()*16777215).toString(16)}`
         });
       }
-    }
 
-    if (categoryCount > 0) {
-      setCategories(newCategories);
-      localStorage.setItem('verdegrana_categories', JSON.stringify(newCategories));
-    } else {
-      setCategories(newCategories);
-    }
+      // Linkage
+      let finalParentId = item.parent_id;
+      if (!finalParentId && item.parent_name) {
+        const found = nextTransactions.find(t => 
+          !t.parent_id && 
+          t.desc.toLowerCase().trim() === item.parent_name.toLowerCase().trim() &&
+          t.profile_name === activeProfile
+        );
+        if (found) finalParentId = found.id;
+      }
+
+      const tx: Transaction = {
+        id: item.id || crypto.randomUUID(),
+        date: item.date || new Date().toISOString().split('T')[0],
+        desc: item.desc,
+        value: item.value,
+        category: item.category || 'Outros',
+        type: item.type || 'saída',
+        profile_name: activeProfile,
+        status: item.status || 'realizado',
+        is_redutora: item.is_redutora === true,
+        parent_id: finalParentId,
+        parent_name: item.parent_name || null,
+        updatedAt: new Date().toISOString()
+      };
+      nextTransactions.push(tx);
+      createdCount++;
+    });
+
+    setTransactions(nextTransactions);
+    pushToHistory(nextTransactions);
+    setCategories(newCategories);
+    setIsPreviewModalOpen(false);
     
-    // Single summary notification
-    const totalProcessed = createdCount + mergedCount;
-    if (totalProcessed > 0) {
-      toast.success(`Sucesso! ${totalProcessed} registros processados (${createdCount} novos, ${mergedCount} vinculados). ${categoryCount > 0 ? `${categoryCount} novas categorias.` : ''}`);
+    const summary = `IA Review: ${createdCount} novos, ${updatedCount} editados, ${deletedCount} apagados`;
+    logAudit('Inserção', activeProfile, summary);
+    toast.success('Alterações consolidadas com sucesso!');
+
+    if (isCloudMode && user && supabase && !isDemoMode) {
+      setSyncStatus('saving');
+      const batchIds = verifiedData.map(i => i.id);
+      const batchObjects = nextTransactions.filter(t => batchIds.includes(t.id));
+
+      if (batchObjects.length > 0) {
+        supabase.from('transactions').upsert(batchObjects.map(t => ({
+          id: t.id, user_id: user.id, date: t.date, description: t.desc, category: t.category, type: t.type, amount: t.value,
+          profile_name: t.profile_name, status: t.status, is_redutora: t.is_redutora, 
+          parent_id: (t.parent_id && isUUID(t.parent_id)) ? t.parent_id : null,
+          parent_name: t.parent_name || null, updated_at: t.updatedAt
+        }))).then(({ error }) => {
+          if (error) setSyncStatus('error');
+          else {
+            setSyncStatus('synced');
+            supabase.channel(`verdegrana_sync_${user.id}`).send({ type: 'broadcast', event: 'sync', payload: { userId: user.id, clientId, type: 'ai_import' }});
+          }
+        });
+      } else {
+        setSyncStatus('synced');
+      }
     }
-  }, [categories, transactions, activeProfile, isCloudMode, user, supabase, isUUID]);
+  }, [categories, transactions, activeProfile, isCloudMode, user, supabase, isDemoMode, clientId, logAudit, pushToHistory, isUUID]);
 
   useEffect(() => {
     localStorage.setItem('verdegrana_active_profile', activeProfile);
@@ -4424,35 +4494,120 @@ function MainApp() {
                         );
                       }
                       return filteredLogs.map(log => (
-                        <div key={log.id} className="flex items-center justify-between p-4 bg-white/2 rounded-2xl border border-white/5">
-                          <div className="flex items-center gap-4">
-                            <div className={cn(
-                              "w-10 h-10 rounded-xl flex items-center justify-center",
-                              log.operation === 'Inserção' ? "bg-emerald-500/10 text-emerald-500" :
-                              log.operation === 'Exclusão' ? "bg-rose-500/10 text-rose-500" :
-                              log.operation === 'Edição' ? "bg-blue-500/10 text-blue-500" : "bg-purple-500/10 text-purple-500"
-                            )}>
-                              {log.operation === 'Inserção' ? <Plus size={18} /> : 
-                               log.operation === 'Exclusão' ? <Trash2 size={18} /> : 
-                               log.operation === 'Edição' ? <Edit3 size={18} /> : <RefreshCw size={18} />}
+                        <div key={log.id} className="space-y-4">
+                          <div 
+                            className={cn(
+                              "flex items-center justify-between p-4 bg-white/2 rounded-2xl border transition-all cursor-pointer",
+                              expandedAuditLogId === log.id ? "border-emerald-500/30 ring-1 ring-emerald-500/20" : "border-white/5 hover:border-white/10"
+                            )}
+                            onClick={() => setExpandedAuditLogId(expandedAuditLogId === log.id ? null : log.id)}
+                          >
+                            <div className="flex items-center gap-4">
+                              <div className={cn(
+                                "w-10 h-10 rounded-xl flex items-center justify-center",
+                                log.operation === 'Inserção' ? "bg-emerald-500/10 text-emerald-500" :
+                                log.operation === 'Exclusão' ? "bg-rose-500/10 text-rose-500" :
+                                log.operation === 'Edição' ? "bg-blue-500/10 text-blue-400" : "bg-white/5 text-slate-500"
+                              )}>
+                                {log.operation === 'Inserção' ? <Plus size={18} /> : 
+                                 log.operation === 'Exclusão' ? <Trash2 size={18} /> : 
+                                 log.operation === 'Edição' ? <Edit3 size={18} /> : <Info size={18} />}
+                              </div>
+                              <div className="min-w-0">
+                                <p className="text-white font-bold text-sm tracking-tight truncate max-w-[200px]">{log.metadata?.description}</p>
+                                <div className="flex items-center gap-2">
+                                  <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">{log.operation}</p>
+                                  <span className="text-slate-800">•</span>
+                                  <p className="text-[10px] text-slate-600 font-mono">
+                                    {new Date(log.timestamp).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}
+                                  </p>
+                                </div>
+                              </div>
                             </div>
-                            <div className="min-w-0">
-                               <p className="font-bold text-white text-xs truncate max-w-[200px]">{log.metadata.description}</p>
-                               <div className="flex items-center gap-2">
-                                 <span className="text-[8px] font-black uppercase text-slate-500">{log.operation}</span>
-                                 <span className="w-1 h-1 bg-slate-700 rounded-full" />
-                                 <span className="text-[8px] font-bold text-slate-400">{log.metadata.profile}</span>
-                               </div>
+                            <div className="flex items-center gap-3">
+                              {log.metadata?.value !== undefined && (
+                                <p className={cn("text-xs font-black", 
+                                  log.operation === 'Exclusão' ? "text-rose-400" : "text-emerald-400"
+                                )}>
+                                  {formatCurrency(log.metadata.value)}
+                                </p>
+                              )}
+                              <div className={cn("transition-transform duration-300", expandedAuditLogId === log.id && "rotate-180")}>
+                                <ChevronDown className="w-4 h-4 text-slate-700" />
+                              </div>
                             </div>
                           </div>
-                          <div className="text-right">
-                             {log.metadata.value !== undefined && (
-                               <p className="font-black text-xs text-white mb-1">{formatCurrency(log.metadata.value)}</p>
-                             )}
-                             <p className="text-[8px] text-slate-500 font-mono italic">
-                               {new Date(log.timestamp).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} • {new Date(log.timestamp).toLocaleDateString()}
-                             </p>
-                          </div>
+
+                          <AnimatePresence>
+                            {expandedAuditLogId === log.id && (
+                              <motion.div
+                                initial={{ height: 0, opacity: 0 }}
+                                animate={{ height: 'auto', opacity: 1 }}
+                                exit={{ height: 0, opacity: 0 }}
+                                className="overflow-hidden"
+                              >
+                                <div className="p-6 bg-white/[0.03] border border-white/5 rounded-2xl ml-4 space-y-4">
+                                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    {log.metadata.old_data && (
+                                      <div className="space-y-2">
+                                        <p className="text-[10px] font-black text-rose-500 uppercase tracking-widest">Estado Anterior</p>
+                                        <div className="p-3 bg-black/40 rounded-xl border border-white/5 font-mono text-[10px] text-slate-400 overflow-x-auto whitespace-pre">
+                                          {JSON.stringify(log.metadata.old_data, null, 2)}
+                                        </div>
+                                      </div>
+                                    )}
+                                    {log.metadata.new_data && (
+                                      <div className="space-y-2">
+                                        <p className="text-[10px] font-black text-emerald-500 uppercase tracking-widest">Novo Estado</p>
+                                        <div className="p-3 bg-black/40 rounded-xl border border-white/5 font-mono text-[10px] text-slate-300 overflow-x-auto whitespace-pre">
+                                          {JSON.stringify(log.metadata.new_data, null, 2)}
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+
+                                  <div className="flex items-center justify-between pt-4 border-t border-white/5">
+                                    <div className="space-y-1">
+                                      <p className="text-[9px] text-slate-500 font-bold uppercase">ID da Transação</p>
+                                      <p className="text-[10px] text-slate-300 font-mono truncate max-w-[150px]">{log.metadata.tx_id || "BATCH_OP"}</p>
+                                    </div>
+                                    <div className="flex gap-2">
+                                      {log.operation !== 'Desfazer' && (
+                                        <button 
+                                          onClick={(e) => { e.stopPropagation(); handleRevertAudit(log); }}
+                                          className="flex items-center gap-2 px-4 py-2 bg-amber-500/10 text-amber-500 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-amber-500/20 transition-all border border-amber-500/20"
+                                        >
+                                          <Undo2 className="w-3 h-3" /> Desfazer Alteração
+                                        </button>
+                                      )}
+                                      {log.metadata.tx_id && (
+                                        <button 
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            const tx = transactions.find(t => t.id === log.metadata.tx_id);
+                                            if (tx) {
+                                              setEditingTransaction(tx);
+                                              setIsAddModalOpen(true);
+                                            } else {
+                                              // Multi ID check for deletion
+                                              if (log.operation === 'Exclusão' && log.metadata.tx_id.includes(',')) {
+                                                toast.info("Restaure a exclusão para depois editar os itens.");
+                                              } else {
+                                                toast.error("Transação original não encontrada.");
+                                              }
+                                            }
+                                          }}
+                                          className="flex items-center gap-2 px-4 py-2 bg-blue-500/10 text-blue-400 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-blue-500/20 transition-all border border-blue-500/20"
+                                        >
+                                          <Edit3 className="w-3 h-3" /> Editar Registro
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
                         </div>
                       ));
                     })()}
@@ -4489,46 +4644,45 @@ function MainApp() {
                     </div>
                     <button 
                       onClick={() => {
-                        const prompt = `Você é um motor de parsing financeiro profissional para o app VerdeGrana.
-Sua missão é converter descrições complexas em JSON estruturado para importação direta.
+                        const validParents = profileTransactions.filter(t => !t.parent_id).map(t => t.desc);
+                        const prompt = `Você é um assistente financeiro mestre e motor de parsing para o app VerdeGrana.
+Sua missão é converter descrições financeiras em um objeto estruturado para o sistema.
 
-REGRAS DE OURO:
-1. Identifique se é 'entrada' (receita) ou 'saída' (despesa).
-2. Categorias disponíveis: [${categories.map(c => c.name).join(', ')}]. Use 'Outros' se não encaixar perfeitamente.
-3. Formato de Data: YYYY-MM-DD. Use ${new Date().getFullYear()} como base.
-4. LÓGICA DE ANEXOS (Deduções e Acréscimos):
-   - Se houver descontos, deduções ou impostos (ex: imposto retido, desconto em salário), inclua-os no array 'deductions'.
-   - Se houver acréscimos, juros ou multas, inclua-os no array 'additions'.
-   - Cada anexo deve ser um objeto com: {"description": "string", "amount": number, "category": "string"}.
-5. O valor deve ser sempre um número POSITIVO no JSON.
+REGRAS DE INTERAÇÃO (CRÍTICO):
+- Se o usuário disser "Olá", "Oi" ou saudações similares, responda de forma extremamente amigável, educada e prestativa em português, perguntando como pode ajudar a organizar as finanças hoje. NÃO envie JSON nestas saudações iniciais.
+- Só envie o JSON quando houver dados financeiros (extratos, falas de gastos, pedidos de alteração) para processar.
 
-SCHEMA DE RESPOSTA:
-[
-  {
-    "date": "YYYY-MM-DD",
-    "desc": "string",
-    "value": number,
-    "category": "string",
-    "type": "entrada|saída",
-    "deductions": [
-       {"description": "string", "amount": number, "category": "string"}
-    ],
-    "additions": [
-       {"description": "string", "amount": number, "category": "string"}
-    ]
-  }
-]
+ESTRUTURA DE RESPOSTA PARA DADOS (JSON BRUTO, SEM CÓDIGO MD):
+{
+  "user_friendly_summary": "Um texto amigável, legível e em tópicos detalhando exatamente o que foi processado.",
+  "transactions": [
+    {
+      "operation": "insert|update|delete",
+      "id": "UUID (se novo) ou ID existente",
+      "date": "YYYY-MM-DD",
+      "desc": "string",
+      "value": number (positivo),
+      "category": "string",
+      "type": "entrada|saída",
+      "status": "realizado|pendente",
+      "parent_name": "NOME DA CONTA PAI EXATA",
+      "is_redutora": boolean
+    }
+  ]
+}
 
-EXEMPLO DE INPUT: "Recebi salário de 5000 mas teve 200 de desconto de imposto e 100 de bônus"
-EXEMPLO DE OUTPUT:
-[{"date": "2024-05-17", "desc": "Salário", "value": 5000, "category": "Trabalho", "type": "entrada", "deductions": [{"description": "Imposto Retido", "amount": 200, "category": "Trabalho"}], "additions": [{"description": "Bônus", "amount": 100, "category": "Trabalho"}]}]
+REGRAS DE LÓGICA E CONTABILIDADE:
+1. SUBCOTAS / PARENT_NAME:
+   - Use 'parent_name' APENAS se o usuário citar explicitamente uma destas contas existentes: [${validParents.length > 0 ? validParents.join(', ') : 'Nenhuma conta principal cadastrada ainda'}]. 
+   - Se a conta citada não estiver na lista acima, ignore o parent_name ou sugira a criação. NÃO invente nomes de contas.
+2. IS_REDUTORA (DEFINIÇÃO EXATA):
+   - is_redutora: true -> APENAS para sub-itens que DIMINUEM o valor do pai (ex: Imposto Retido no Salário, Desconto em Compra).
+   - is_redutora: false -> Para despesas normais, adições ou lançamentos padrão, mesmo que vinculados a um pai.
+3. CATEGORIAS: [${categories.map(c => c.name).join(', ')}]. Use 'Outros' se necessário.
+4. RESPOSTA DE DADOS: Retire qualquer bloco de código Markdown (\`\`\`json). Envie apenas o objeto {}.`;
 
-REGRAS DE INTERAÇÃO:
-- Ao receber estas instruções, você NÃO DEVE gerar nenhum JSON ou inventar dados fictícios.
-- Apenas confirme que entendeu as regras respondendo EXATAMENTE com a seguinte frase: 'Olá! O que o senhor gostaria de registrar? Pode me dizer.'
-- Aguarde o meu próximo envio, onde eu direi os valores reais. Só então você deve aplicar a lógica e retornar o código JSON (APENAS o JSON bruto, sem explicações).`;
                         navigator.clipboard.writeText(prompt);
-                        toast.success('Prompt mestre copiado!');
+                        toast.success('Prompt mestre atualizado e copiado!');
                       }}
                       className="w-full py-5 bg-emerald-600 rounded-3xl font-bold hover:bg-emerald-500 transition-all shadow-xl shadow-emerald-600/30 flex items-center justify-center gap-3"
                     >
@@ -4542,21 +4696,64 @@ REGRAS DE INTERAÇÃO:
                     <div className="p-3 bg-blue-500/20 rounded-2xl text-blue-400"><RefreshCw className={isAiProcessing ? "animate-spin" : ""} /></div>
                     <h3 className="text-xl font-bold text-white">Importador Inteligente</h3>
                   </div>
-                  <textarea 
-                    id="ai-json" placeholder="Cole o JSON da IA aqui..." 
-                    className="flex-1 min-h-[300px] bg-black/40 border border-white/5 rounded-[2rem] p-8 text-xs font-mono text-emerald-500 focus:border-emerald-500/50 outline-none resize-none"
-                  />
+                  <div className="relative group">
+                    <textarea 
+                      id="ai-json" placeholder="Cole o JSON da IA ou use o microfone para descrever..." 
+                      className="w-full min-h-[300px] bg-black/40 border border-white/5 rounded-[2rem] p-8 text-xs font-mono text-emerald-500 focus:border-emerald-500/50 outline-none resize-none"
+                    />
+                    <div className="absolute bottom-6 right-6 flex gap-2">
+                       <button 
+                        onClick={() => {
+                          const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+                          if (!SpeechRecognition) {
+                            toast.error("Reconhecimento de voz não suportado neste navegador.");
+                            return;
+                          }
+                          const recognition = new SpeechRecognition();
+                          recognition.lang = 'pt-BR';
+                          recognition.start();
+                          toast.info("Ouvindo... Fale sua instrução.");
+                          recognition.onresult = (event: any) => {
+                            const text = event.results[0][0].transcript;
+                            const area = document.getElementById('ai-json') as HTMLTextAreaElement;
+                            area.value = (area.value ? area.value + "\n" : "") + "COMANDO DE VOZ: " + text;
+                            toast.success("Voz capturada! Copie o texto e peça para a IA gerar o JSON.");
+                          };
+                        }}
+                        className="p-4 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 rounded-2xl border border-emerald-500/20 transition-all"
+                        title="Ditar Comando"
+                       >
+                         <Mic className="w-5 h-5" />
+                       </button>
+                    </div>
+                  </div>
                   <button 
                     onClick={() => {
                       setIsAiProcessing(true);
                       const area = document.getElementById('ai-json') as HTMLTextAreaElement;
+                      if (!area.value.trim()) {
+                        toast.error("Cole o JSON primeiro!");
+                        setIsAiProcessing(false);
+                        return;
+                      }
                       setTimeout(() => {
                         try {
-                          const data = JSON.parse(area.value);
+                          const text = area.value.trim();
+                          const start = text.indexOf('{');
+                          const end = text.lastIndexOf('}');
+                          
+                          if (start === -1 || end === -1 || end <= start) {
+                            throw new Error("JSON não encontrado no texto.");
+                          }
+
+                          const jsonStr = text.substring(start, end + 1);
+                          const data = JSON.parse(jsonStr);
                           processImport(data);
-                          setActiveTab('reports');
                           area.value = '';
-                        } catch (e) { toast.error('Falha no formato JSON.'); }
+                        } catch (e) { 
+                          console.error("JSON Error:", e);
+                          toast.error('Falha ao extrair dados. Certifique-se de colar a resposta completa da IA.'); 
+                        }
                         setIsAiProcessing(false);
                       }, 1000);
                     }}
@@ -5737,6 +5934,206 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                   className="w-full py-4 bg-white/5 border border-white/10 text-slate-400 hover:text-white rounded-2xl font-black text-xs uppercase tracking-widest active:scale-95 transition-all"
                 >
                   Agora não, retornar ao painel
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* AI Import Preview Modal */}
+      <AnimatePresence>
+        {isPreviewModalOpen && (
+          <div className="fixed inset-0 z-[150] flex items-center justify-center p-4 bg-slate-950/95 backdrop-blur-md">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 30 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 30 }}
+              className="w-full max-w-5xl max-h-[90vh] bg-slate-900 border border-white/10 rounded-[3.5rem] flex flex-col shadow-[0_0_100px_rgba(16,185,129,0.1)] overflow-hidden"
+            >
+              {/* Header */}
+              <div className="p-8 border-b border-white/5 flex items-center justify-between bg-emerald-500/5">
+                <div className="flex items-center gap-4">
+                  <div className="p-3 bg-emerald-500/20 rounded-2xl text-emerald-500">
+                    <RefreshCw className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h2 className="text-xl font-black text-white uppercase tracking-tighter">Revisão do Importador</h2>
+                    <p className="text-xs text-slate-400 font-bold uppercase tracking-widest">Confirme os dados interpretados pela IA antes de salvar</p>
+                  </div>
+                </div>
+                <button 
+                  onClick={() => setIsPreviewModalOpen(false)}
+                  className="p-3 bg-white/5 hover:bg-white/10 rounded-2xl text-slate-500 hover:text-white transition-all"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+
+              {/* Content */}
+              <div className="flex-1 overflow-y-auto p-8 space-y-8 custom-scrollbar">
+                {/* AI Summary Block */}
+                <div className="bg-white/5 border border-emerald-500/20 rounded-3xl p-6 relative overflow-hidden">
+                  <div className="absolute top-0 left-0 w-1 h-full bg-emerald-500" />
+                  <div className="flex items-center gap-2 mb-3">
+                    <MessageSquare className="w-4 h-4 text-emerald-500" />
+                    <h3 className="text-[10px] font-black text-emerald-400 uppercase tracking-widest">Relatório do seu Assistente</h3>
+                  </div>
+                  <div className="text-slate-300 text-sm leading-relaxed whitespace-pre-line font-medium italic">
+                    "{aiSummary}"
+                  </div>
+                </div>
+
+                {/* Transactions Preview List */}
+                <div className="space-y-4">
+                  <h3 className="text-[10px] font-black text-slate-500 uppercase tracking-widest px-2">Registros Detectados ({previewData.length})</h3>
+                  <div className="space-y-3">
+                    {previewData.map((item) => {
+                      const hasParentRequirement = item.parent_name || item.parent_id;
+                      const parentFound = item.parent_id || (item.parent_name && profileTransactions.some(t => !t.parent_id && t.desc.toLowerCase().trim() === item.parent_name.toLowerCase().trim()));
+                      
+                      return (
+                        <div key={item.tempId} className={cn(
+                          "bg-white/5 border rounded-3xl p-5 flex flex-col md:flex-row items-center gap-6 transition-all",
+                          item.operation === 'delete' ? "border-rose-500/20 opacity-60" : "border-white/5"
+                        )}>
+                          {/* Indicator */}
+                          <div className={cn(
+                            "w-12 h-12 rounded-2xl flex items-center justify-center flex-shrink-0",
+                            item.operation === 'delete' ? "bg-rose-500/10 text-rose-500" :
+                            item.operation === 'update' ? "bg-blue-500/10 text-blue-400" : "bg-emerald-500/10 text-emerald-500"
+                          )}>
+                            {item.operation === 'delete' ? <Trash2 size={20} /> :
+                             item.operation === 'update' ? <Edit3 size={20} /> : <Plus size={20} />}
+                          </div>
+
+                          {/* Inputs */}
+                          <div className="flex-1 grid grid-cols-1 md:grid-cols-4 gap-4 w-full">
+                            <div className="space-y-1">
+                              <label className="text-[8px] font-black text-slate-600 uppercase tracking-widest px-1">Descrição</label>
+                              <input 
+                                className="w-full bg-black/40 border border-white/5 rounded-xl px-3 py-2 text-white text-xs font-bold focus:border-emerald-500/50 outline-none"
+                                value={item.desc}
+                                onChange={(e) => {
+                                  const next = [...previewData];
+                                  const idx = next.findIndex(p => p.tempId === item.tempId);
+                                  next[idx].desc = e.target.value;
+                                  setPreviewData(next);
+                                }}
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[8px] font-black text-slate-600 uppercase tracking-widest px-1">Valor</label>
+                              <input 
+                                type="number"
+                                className="w-full bg-black/40 border border-white/5 rounded-xl px-3 py-2 text-white text-xs font-bold focus:border-emerald-500/50 outline-none"
+                                value={item.value}
+                                onChange={(e) => {
+                                  const next = [...previewData];
+                                  const idx = next.findIndex(p => p.tempId === item.tempId);
+                                  next[idx].value = parseFloat(e.target.value);
+                                  setPreviewData(next);
+                                }}
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[8px] font-black text-slate-600 uppercase tracking-widest px-1">Data</label>
+                              <input 
+                                type="date"
+                                className="w-full bg-black/40 border border-white/5 rounded-xl px-3 py-2 text-white text-xs font-bold focus:border-emerald-500/50 outline-none"
+                                value={item.date}
+                                onChange={(e) => {
+                                  const next = [...previewData];
+                                  const idx = next.findIndex(p => p.tempId === item.tempId);
+                                  next[idx].date = e.target.value;
+                                  setPreviewData(next);
+                                }}
+                              />
+                            </div>
+                            <div className="space-y-1">
+                              <label className="text-[8px] font-black text-slate-600 uppercase tracking-widest px-1">Categoria</label>
+                              <select 
+                                className="w-full bg-black/40 border border-white/5 rounded-xl px-3 py-2 text-white text-xs font-bold focus:border-emerald-500/50 outline-none"
+                                value={item.category}
+                                onChange={(e) => {
+                                  const next = [...previewData];
+                                  const idx = next.findIndex(p => p.tempId === item.tempId);
+                                  next[idx].category = e.target.value;
+                                  setPreviewData(next);
+                                }}
+                              >
+                                {categories.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+                              </select>
+                            </div>
+                          </div>
+
+                          {/* Relational Validation (The "Fear" Logic) */}
+                          <div className="w-full md:w-64 space-y-1">
+                            <label className="text-[8px] font-black text-slate-600 uppercase tracking-widest px-1 flex items-center justify-between">
+                              Subconta de:
+                              {hasParentRequirement && !parentFound && (
+                                <span className="text-rose-500 flex items-center gap-1"><AlertTriangle size={8}/> Orfã!</span>
+                              )}
+                            </label>
+                              <select 
+                                className={cn(
+                                  "w-full bg-black/40 border rounded-xl px-3 py-2 text-[10px] font-bold outline-none transition-all",
+                                  hasParentRequirement && !parentFound ? "border-rose-500 text-rose-500" : "border-white/5 text-slate-400"
+                                )}
+                                value={item.parent_id || ""}
+                                onChange={(e) => {
+                                  const next = [...previewData];
+                                  const idx = next.findIndex(p => p.tempId === item.tempId);
+                                  next[idx].parent_id = e.target.value || null;
+                                  // Clear parent_name if manually selected
+                                  if (e.target.value) next[idx].parent_name = null;
+                                  setPreviewData(next);
+                                }}
+                              >
+                                <option value="">(Nenhuma / Conta Principal)</option>
+                                <optgroup label="Contas Existentes">
+                                  {profileTransactions.filter(t => !t.parent_id).map(t => (
+                                    <option key={t.id} value={t.id}>{t.desc}</option>
+                                  ))}
+                                </optgroup>
+                                {previewData.some(p => !p.parent_id && !p.parent_name && p.tempId !== item.tempId) && (
+                                  <optgroup label="Novas Contas no Import">
+                                    {previewData.filter(p => !p.parent_id && !p.parent_name && p.tempId !== item.tempId).map(p => (
+                                      <option key={p.id} value={p.id}>{p.desc}</option>
+                                    ))}
+                                  </optgroup>
+                                )}
+                              </select>
+                          </div>
+
+                          {/* Action */}
+                          <button 
+                            onClick={() => setPreviewData(prev => prev.filter(p => p.tempId !== item.tempId))}
+                            className="p-2 text-slate-600 hover:text-rose-500 transition-all"
+                            title="Remover do Preview"
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div className="p-8 border-t border-white/5 flex items-center justify-end gap-4 bg-black/20">
+                <button 
+                  onClick={() => setIsPreviewModalOpen(false)}
+                  className="px-8 py-4 bg-white/5 hover:bg-white/10 rounded-2xl text-slate-400 font-bold text-xs uppercase tracking-widest transition-all"
+                >
+                  Cancelar
+                </button>
+                <button 
+                  onClick={() => confirmImport(previewData)}
+                  className="px-8 py-4 bg-emerald-500 hover:bg-emerald-400 rounded-2xl text-white font-black text-xs uppercase tracking-widest shadow-xl shadow-emerald-500/20 active:scale-95 transition-all flex items-center gap-2"
+                >
+                  <Save className="w-4 h-4" /> Confirmar e Salvar Tudo
                 </button>
               </div>
             </motion.div>
