@@ -699,7 +699,15 @@ const CategoryDonutSection = ({
 type BootStage = 'splash' | 'presentation' | 'auth' | 'folder_setup' | 'sync_initial' | 'welcome' | 'profile_select' | 'ready' | 'syncing';
 
 export default function App() {
-  const isFileSystemApiSupported = typeof window !== 'undefined' && !!(window as any).showDirectoryPicker;
+  const isFileSystemApiSupported = typeof window !== 'undefined' && 
+    !!(window as any).showDirectoryPicker &&
+    (() => {
+      try {
+        return window.self === window.top;
+      } catch (e) {
+        return false;
+      }
+    })();
   const [bootStage, setBootStage] = useState<BootStage>('splash');
   const [rescueProfile, setRescueProfile] = useState<ProfileInfo | null>(null);
   const [user, setUser] = useState<any>(null);
@@ -1024,11 +1032,16 @@ export default function App() {
   const [profilesList, setProfilesList] = useState<ProfileInfo[]>(() => {
     const saved = localStorage.getItem('verdegrana_profiles_list');
     const initial = saved ? JSON.parse(saved) : [];
-    // Migration: Handle both old string array and new object array
+    // Migration: Handle both old string array and new object array with full defensive checking
     return (initial as any[]).map(p => {
-      if (typeof p === 'string') return { name: p, source: 'local' as const };
-      return p as ProfileInfo;
-    });
+      if (typeof p === 'string') return { name: p.trim(), source: 'local' as const };
+      if (p && typeof p === 'object') {
+        const nameVal = typeof p.name === 'object' && p.name ? (p.name.name || '') : p.name;
+        const cleanName = String(nameVal || '').trim();
+        return { name: cleanName, source: (p.source || 'local') as ProfileSource };
+      }
+      return null;
+    }).filter((p): p is ProfileInfo => !!p && p.name.length > 0);
   });
 
   const [uiScale, setUiScale] = useState<number>(() => {
@@ -1063,7 +1076,8 @@ export default function App() {
       const { data: profiles, error: pError } = await supabase.from('profiles').select('name').eq('user_id', userId);
       if (pError) throw pError;
 
-      const profileNames = Array.from(new Set(profiles.map((p: any) => p.name))) as string[];
+      const profileNames = Array.from(new Set<string>(profiles.map((p: any) => String(p.name || '').trim())))
+        .filter(name => name.length > 0);
       
       // 2. Download all transactions
       const { data: txs, error: txError } = await supabase.from('transactions').select('*').eq('user_id', userId);
@@ -1149,23 +1163,34 @@ export default function App() {
     const map = new Map<string, ProfileInfo>();
     
     // Use trimmed and lowercase name as stable key for deduplication
-    const getKey = (name: string) => name.trim().toLowerCase();
+    const getKey = (name: any) => {
+      const rawName = name && typeof name === 'object' ? (name.name || '') : name;
+      return String(rawName || '').trim().toLowerCase();
+    };
 
     current.forEach(p => {
+      if (!p) return;
       const key = getKey(p.name);
-      map.set(key, { ...p, name: p.name.trim() });
+      if (!key) return;
+      const rawName = typeof p.name === 'object' && p.name ? (p.name as any).name : p.name;
+      const cleanName = String(rawName || '').trim();
+      map.set(key, { ...p, name: cleanName });
     });
     
     incoming.forEach(inc => {
+      if (!inc) return;
       const key = getKey(inc.name);
+      if (!key) return;
+      const rawName = typeof inc.name === 'object' && inc.name ? (inc.name as any).name : inc.name;
+      const cleanName = String(rawName || '').trim();
       const existing = map.get(key);
       if (existing) {
         // If one is cloud and other is local, mark as both
         if (existing.source !== inc.source && existing.source !== 'both') {
-          map.set(key, { name: inc.name.trim(), source: 'both' });
+          map.set(key, { name: cleanName, source: 'both' });
         }
       } else {
-        map.set(key, { ...inc, name: inc.name.trim() });
+        map.set(key, { ...inc, name: cleanName });
       }
     });
     
@@ -1481,18 +1506,24 @@ export default function App() {
   const allProfiles = useMemo(() => {
     const unique = new Map<string, ProfileInfo>();
     profilesList.forEach(p => {
-      if (!p || !p.name) return;
-      const key = p.name.trim().toLowerCase();
+      if (!p) return;
+      const rawName = p.name && typeof p.name === 'object' ? (p.name as any).name : p.name;
+      const name = String(rawName || '').trim();
+      if (!name) return;
+      
+      const key = name.toLowerCase();
       // Keep existing record if already 'both', or if incoming is 'both'
       const existing = unique.get(key);
+      const source = p.source || 'local';
+      
       if (existing) {
         if (existing.source === 'both') return;
-        if (p.source !== existing.source) {
-          unique.set(key, { name: p.name.trim(), source: 'both' });
+        if (source !== existing.source) {
+          unique.set(key, { name, source: 'both' });
           return;
         }
       } else {
-        unique.set(key, { ...p, name: p.name.trim() });
+        unique.set(key, { ...p, name, source });
       }
     });
     return Array.from(unique.values()).sort((a,b) => a.name.localeCompare(b.name));
@@ -1872,7 +1903,15 @@ export default function App() {
       }
       
       if (userMeta?.data?.profilesList) {
-        const cloudProfiles: ProfileInfo[] = (userMeta.data.profilesList as string[]).map(name => ({ name, source: 'cloud' as const }));
+        const cloudProfiles: ProfileInfo[] = (userMeta.data.profilesList as any[]).map(p => {
+          if (typeof p === 'string') return { name: p.trim(), source: 'cloud' as ProfileSource };
+          if (p && typeof p === 'object') {
+            const nameVal = typeof p.name === 'object' && p.name ? (p.name.name || '') : p.name;
+            const cleanName = String(nameVal || '').trim();
+            return { name: cleanName, source: 'cloud' as ProfileSource };
+          }
+          return null;
+        }).filter((p): p is ProfileInfo => !!p && p.name.length > 0);
         setProfilesList(prev => mergeProfiles(prev, cloudProfiles));
       }
 
@@ -1939,7 +1978,19 @@ export default function App() {
         mappedTxs.forEach(t => txMap.set(t.id, t));
         
         const now = new Date().getTime();
-        const pendingIds = new Set(syncQueue.filter(q => q.type.startsWith('tx_')).map(q => q.payload.id || q.payload));
+        const pendingIds = new Set<string>();
+        syncQueue.forEach(q => {
+          if (!q || !q.type) return;
+          if (q.type === 'tx_add' || q.type === 'tx_update') {
+            if (q.payload && q.payload.id) {
+              pendingIds.add(String(q.payload.id));
+            }
+          } else if (q.type === 'tx_delete') {
+            if (q.payload && Array.isArray(q.payload.ids)) {
+              q.payload.ids.forEach((id: any) => pendingIds.add(String(id)));
+            }
+          }
+        });
 
         prev.forEach(p => {
           const cloudEntry = txMap.get(p.id);
@@ -2327,9 +2378,15 @@ export default function App() {
           localStorage.setItem('verdegrana_categories', JSON.stringify(newData.categories));
         }
         if (newData?.profilesList) {
-          const migrated = (newData.profilesList as any[]).map(p => 
-            typeof p === 'string' ? { name: p, source: 'cloud' as const } : p
-          );
+          const migrated = (newData.profilesList as any[]).map(p => {
+            if (typeof p === 'string') return { name: p.trim(), source: 'cloud' as const };
+            if (p && typeof p === 'object') {
+              const nameVal = typeof p.name === 'object' && p.name ? (p.name.name || '') : p.name;
+              const cleanName = String(nameVal || '').trim();
+              return { name: cleanName, source: (p.source || 'cloud') as ProfileSource };
+            }
+            return null;
+          }).filter((p): p is ProfileInfo => !!p && p.name.length > 0);
           setProfilesList(migrated);
         }
       })
@@ -2346,7 +2403,9 @@ export default function App() {
         if (senderId === user.id && senderClientId !== clientId) {
           console.log('Real-time Channel: SYNC Broadcast Received', payload);
           // When someone else syncs, we force a fetch to be sure
-          setTimeout(() => fetchCloudData(user.id), 500);
+          setTimeout(() => {
+            if (user?.id) fetchCloudData(user.id);
+          }, 500);
         }
       })
       .subscribe(async (status: string) => {
@@ -2356,7 +2415,9 @@ export default function App() {
         }
         if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
           console.warn("WebSocket connection issue. Retrying data fetch.");
-          setTimeout(() => fetchCloudData(user.id), 2000);
+          setTimeout(() => {
+            if (user?.id) fetchCloudData(user.id);
+          }, 2000);
         }
       });
 
@@ -3227,7 +3288,7 @@ export default function App() {
               <button
                 key={p.name}
                 onClick={async () => {
-                  if (p.source === 'cloud') {
+                  if (p.source === 'cloud' && isFileSystemApiSupported) {
                     setRescueProfile(p);
                     return;
                   }
@@ -3326,18 +3387,20 @@ export default function App() {
                       onClick={async () => {
                         const pName = rescueProfile.name;
                         try {
-                          // @ts-ignore
-                          const handle = await window.showDirectoryPicker();
-                          setFolderHandle(handle);
-                          
-                          // UI feedback starts here
-                          await downloadCloudToFolder(user?.id, handle);
+                          if (isFileSystemApiSupported) {
+                            // @ts-ignore
+                            const handle = await window.showDirectoryPicker();
+                            setFolderHandle(handle);
+                            
+                            // UI feedback starts here
+                            await downloadCloudToFolder(user?.id, handle);
+                          }
                           
                           setActiveProfile(pName);
                           await loadProfileData(pName);
                           setRescueProfile(null);
                           setBootStage('ready');
-                          toast.success('Perfil resgatado com sucesso!');
+                          toast.success(isFileSystemApiSupported ? 'Perfil resgatado com sucesso!' : 'Perfil ativado em modo nuvem com sucesso!');
                         } catch (e: any) {
                           if (e.name === 'AbortError') return;
                           console.error("Erro fatal no resgate:", e);
@@ -4414,7 +4477,7 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                           <div className="flex items-center gap-2 mt-2">
                             <button
                               onClick={() => {
-                                if (p.source === 'cloud' && !folderHandle && !isDemoMode) {
+                                if (p.source === 'cloud' && !folderHandle && !isDemoMode && isFileSystemApiSupported) {
                                   setRescueProfile(p);
                                   return;
                                 }
