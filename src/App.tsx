@@ -155,10 +155,25 @@ interface Transaction {
   profile_name: string;
   status: TransactionStatus;
   is_redutora: boolean;
+  impact_type?: 'aumentar' | 'diminuir' | 'neutro';
   parent_id?: string;
   parent_name?: string;
   updatedAt?: string;
 }
+
+const getChildImpact = (c: Transaction, parent?: Transaction): 'aumentar' | 'diminuir' | 'neutro' => {
+  if (c.impact_type) return c.impact_type;
+  if (c.is_redutora) return 'diminuir';
+  
+  if (parent) {
+    if (c.type !== parent.type) {
+      return 'diminuir';
+    } else {
+      return 'aumentar';
+    }
+  }
+  return 'aumentar';
+};
 
 interface AuditLog {
   id: string;
@@ -611,7 +626,8 @@ const ComparisonChart = ({
   setColorMode,
   viewMode,
   setViewMode,
-  title 
+  title,
+  onCategoryClick
 }: { 
   data: any[], 
   colorMode: 'unique' | 'flow',
@@ -998,6 +1014,7 @@ function MainApp() {
   });
   const [categoryFilters, setCategoryFilters] = useState<string[]>([]);
   const [selectedTxIds, setSelectedTxIds] = useState<string[]>([]);
+  const [isBulkEditModalOpen, setIsBulkEditModalOpen] = useState(false);
   const [sortConfig, setSortConfig] = useState<'default' | 'updated' | 'value'>('default');
   const [valueSortOrder, setValueSortOrder] = useState<'asc' | 'desc'>('desc');
   const [updateSortOrder, setUpdateSortOrder] = useState<'asc' | 'desc'>('desc');
@@ -1006,7 +1023,84 @@ function MainApp() {
   const [donutColorMode, setDonutColorMode] = useState<'unique' | 'flow'>('flow');
   const [isComparisonModalOpen, setIsComparisonModalOpen] = useState(false);
   const [categoryToDelete, setCategoryToDelete] = useState<Category | null>(null);
-  const [isAiProcessing, setIsAiProcessing] = useState(false);
+  const [aiChatHistory, setAiChatHistory] = useState<{ role: 'user' | 'assistant', content: string, operations?: any[] }[]>([]);
+  const [currentAiMessage, setCurrentAiMessage] = useState('');
+
+  const executeAiOperations = async (ops: any[]) => {
+    if (!ops || ops.length === 0) return;
+    
+    let createdCount = 0;
+    let updatedCount = 0;
+    let deletedCount = 0;
+
+    for (const op of ops) {
+      try {
+        if (op.type === 'insert') {
+          await handleAddTransaction(op.data);
+          createdCount++;
+        } else if (op.type === 'update' && op.id) {
+          await handleUpdateTransaction(op.id, op.data);
+          updatedCount++;
+        } else if (op.type === 'delete' && op.id) {
+          await handleDeleteTransactions([op.id]);
+          deletedCount++;
+        }
+      } catch (err) {
+        console.error("Single AI op error:", err);
+      }
+    }
+
+    toast.success(`Resultados da IA: ${createdCount} criados, ${updatedCount} editados, ${deletedCount} excluídos.`);
+  };
+
+  const handleAiChat = async () => {
+    if (!currentAiMessage.trim()) return;
+    setIsAiProcessing(true);
+    
+    const userMsg = currentAiMessage;
+    setAiChatHistory(prev => [...prev, { role: 'user', content: userMsg }]);
+    setCurrentAiMessage('');
+
+    try {
+      // Build Dynamic Context
+      const context = {
+        active_profile: activeProfile,
+        profiles: allProfiles.map(p => p.name),
+        categories: categories.map(c => c.name),
+        summary: transactions.filter(t => t.profile_name === activeProfile).slice(0, 50).map(t => ({
+          id: t.id,
+          date: t.date,
+          desc: t.desc,
+          value: t.value,
+          category: t.category,
+          type: t.type,
+          parent_name: t.parent_name,
+          parent_id: t.parent_id,
+          impact: t.impact_type
+        }))
+      };
+
+      const res = await fetch('/api/ai/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMsg, context })
+      });
+
+      if (!res.ok) throw new Error('Falha na comunicação com a IA');
+      const data = await res.json();
+
+      setAiChatHistory(prev => [...prev, { 
+        role: 'assistant', 
+        content: data.user_friendly_summary,
+        operations: data.operations
+      }]);
+
+    } catch (err: any) {
+      toast.error('Erro na IA: ' + err.message);
+    } finally {
+      setIsAiProcessing(false);
+    }
+  };
   const [donutType, setDonutType] = useState<'saída' | 'entrada'>('saída');
   const [donutViewMode, setDonutViewMode] = useState<'tudo' | 'receitas' | 'despesas'>('tudo');
   const [selectedPeriod, setSelectedPeriod] = useState<string | null>(null);
@@ -1016,6 +1110,7 @@ function MainApp() {
   const [txStatusForm, setTxStatusForm] = useState<TransactionStatus>('realizado');
   const [pendingDateType, setPendingDateType] = useState<'definida' | 'indefinida' | 'escolhida'>('definida');
   const [isRecurring, setIsRecurring] = useState(false);
+  const [recurrenceConfig, setRecurrenceConfig] = useState({ count: 1, interval: 1, type: 'day' as 'day' | 'week' | 'month' | 'year' });
   
   const [isChartReady, setIsChartReady] = useState(false);
   const [isDashboardRevealed, setIsDashboardRevealed] = useState(false);
@@ -2112,6 +2207,7 @@ function MainApp() {
           profile_name: activeProfile,
           status: newTx.status,
           is_redutora: newTx.is_redutora,
+          impact_type: newTx.impact_type,
           parent_id: (data.parent_id && isUUID(data.parent_id)) ? data.parent_id : null,
           parent_name: data.parent_name || null,
           updated_at: newTx.updatedAt
@@ -2153,6 +2249,7 @@ function MainApp() {
       if (data.status !== undefined) updatePayload.status = data.status;
       if (data.is_redutora !== undefined) updatePayload.is_redutora = data.is_redutora;
       if (data.parent_name !== undefined) updatePayload.parent_name = data.parent_name;
+      if (data.impact_type !== undefined) updatePayload.impact_type = data.impact_type;
       
       if (data.parent_id !== undefined) {
         updatePayload.parent_id = (data.parent_id && isUUID(data.parent_id)) ? data.parent_id : null;
@@ -2202,6 +2299,99 @@ function MainApp() {
       }
     } else {
       toast.success('Lançamentos excluídos!');
+    }
+  };
+
+  const handleBulkUpdateTransactions = async (ids: string[], data: Partial<Transaction>) => {
+    const toUpdate = transactions.filter(t => ids.includes(t.id));
+    if (toUpdate.length === 0) return;
+
+    const cleanData: Partial<Transaction> = {};
+    if (data.date !== undefined && data.date !== '') cleanData.date = data.date;
+    if (data.desc !== undefined && data.desc !== '') cleanData.desc = data.desc;
+    if (data.value !== undefined && !isNaN(data.value)) cleanData.value = data.value;
+    if (data.category !== undefined && data.category !== '') cleanData.category = data.category;
+    if (data.type !== undefined) cleanData.type = data.type;
+    if (data.status !== undefined) cleanData.status = data.status;
+    if (data.is_redutora !== undefined) cleanData.is_redutora = data.is_redutora;
+    if (data.impact_type !== undefined) cleanData.impact_type = data.impact_type;
+    if (data.parent_id !== undefined) cleanData.parent_id = data.parent_id;
+    if (data.parent_name !== undefined) cleanData.parent_name = data.parent_name;
+
+    if (Object.keys(cleanData).length === 0) {
+      toast.warning('Nenhum campo selecionado para alteração.');
+      return;
+    }
+
+    const updatedTransactionsList = transactions.map(t => {
+      if (ids.includes(t.id)) {
+        const newIsRedutora = cleanData.is_redutora !== undefined ? cleanData.is_redutora : t.is_redutora;
+        const newImpactType = cleanData.impact_type !== undefined ? cleanData.impact_type : t.impact_type;
+        const newType = cleanData.type !== undefined ? cleanData.type : t.type;
+        const newParentId = cleanData.parent_id !== undefined ? cleanData.parent_id : t.parent_id;
+        const newParentName = cleanData.parent_name !== undefined ? cleanData.parent_name : t.parent_name;
+
+        return {
+          ...t,
+          ...cleanData,
+          is_redutora: newIsRedutora,
+          impact_type: newImpactType,
+          type: newType,
+          parent_id: newParentId,
+          parent_name: newParentName,
+          updatedAt: new Date().toISOString()
+        };
+      }
+      return t;
+    });
+
+    setTransactions(updatedTransactionsList);
+    pushToHistory(updatedTransactionsList);
+
+    const profiles = Array.from(new Set(toUpdate.map(t => t.profile_name)));
+    logAudit(
+      'Edição', 
+      profiles.join(', '), 
+      `Edição em massa de ${toUpdate.length} registros`, 
+      undefined, 
+      toUpdate, 
+      null, 
+      ids.join(',')
+    );
+
+    if (isCloudMode && user && supabase) {
+      const tasks: SyncTask[] = ids.filter(isUUID).map(id => {
+        const updatePayload: any = { updated_at: new Date().toISOString() };
+        if (cleanData.date !== undefined) updatePayload.date = cleanData.date;
+        if (cleanData.desc !== undefined) updatePayload.description = cleanData.desc;
+        if (cleanData.category !== undefined) updatePayload.category = cleanData.category;
+        if (cleanData.type !== undefined) updatePayload.type = cleanData.type;
+        if (cleanData.value !== undefined) updatePayload.amount = cleanData.value;
+        if (cleanData.status !== undefined) updatePayload.status = cleanData.status;
+        if (cleanData.is_redutora !== undefined) updatePayload.is_redutora = cleanData.is_redutora;
+        if (cleanData.parent_name !== undefined) updatePayload.parent_name = cleanData.parent_name;
+        if (cleanData.parent_id !== undefined) {
+          updatePayload.parent_id = (cleanData.parent_id && isUUID(cleanData.parent_id)) ? cleanData.parent_id : null;
+        }
+
+        return {
+          id: crypto.randomUUID(),
+          type: 'tx_update',
+          payload: { id, data: updatePayload },
+          retryCount: 0
+        };
+      });
+
+      if (tasks.length > 0) {
+        setSyncQueue(prev => [...prev, ...tasks]);
+      }
+      if (!navigator.onLine) {
+        toast.error('⚠️ Você está offline. As alterações em massa foram salvas localmente.');
+      } else {
+        toast.success(`Sincronizando alteração de ${ids.length} registros...`);
+      }
+    } else {
+      toast.success(`${ids.length} lançamentos atualizados com sucesso!`);
     }
   };
 
@@ -2704,6 +2894,7 @@ function MainApp() {
       profile_name: String(t.profile_name || '').trim(),
       status: (t.status === 'pendente' ? 'pendente' : 'realizado') as TransactionStatus,
       is_redutora: !!t.is_redutora,
+      impact_type: t.impact_type,
       parent_id: t.parent_id,
       parent_name: t.parent_name,
       updatedAt: t.updatedAt || t.updated_at
@@ -4515,7 +4706,6 @@ function MainApp() {
                                    <span className={cn("text-[9px] font-black uppercase tracking-[0.15em]", t.is_redutora ? "text-blue-400/80" : "text-slate-500")}>
                                      {t.is_redutora ? `Redutora • ${t.category}` : t.category}
                                    </span>
-                                   <span className="text-[8px] text-slate-700 font-mono">•</span>
                                    <span className="text-[9px] text-slate-600 font-mono">{new Date(t.date).toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' })}</span>
                                  </div>
                               </div>
@@ -4523,11 +4713,21 @@ function MainApp() {
 
                             <div className="text-right flex flex-col items-end justify-center gap-1 flex-shrink-0 cursor-default" onClick={e => e.stopPropagation()}>
                                {(() => {
-                                  const children = currentTransactions.filter(c => c.parent_id === t.id);
+                                  const children = profileTransactions.filter(c => c.parent_id === t.id);
                                   const isParent = children.length > 0;
                                   
                                   if (isParent) {
-                                    const realValue = children.reduce((acc, c) => acc + (c.is_redutora ? -Number(c.value) : Number(c.value)), Number(t.value));
+                                    const realValue = children.reduce((acc, c) => {
+                                      if (c.status !== 'realizado') return acc;
+                                      const impact = getChildImpact(c, t);
+                                      if (impact === 'diminuir') {
+                                        return acc - Number(c.value);
+                                      } else if (impact === 'aumentar') {
+                                        return acc + Number(c.value);
+                                      }
+                                      return acc;
+                                    }, t.status === 'realizado' ? Number(t.value) : 0);
+                                    
                                     return (
                                       <div className="flex flex-col items-end">
                                         <p className="text-[10px] font-bold text-slate-500 line-through decoration-rose-500/50">
@@ -4536,7 +4736,7 @@ function MainApp() {
                                         <div className="flex items-center gap-1.5 bg-white/5 px-2 py-1 rounded-lg mt-0.5 border border-white/5">
                                           <span className="text-[8px] font-bold uppercase tracking-widest text-emerald-400/80">Real</span>
                                           <p className={cn("font-black text-sm", t.type === 'entrada' ? "text-emerald-400" : "text-rose-400")}>
-                                            {t.type === 'entrada' ? '+' : '-'} {formatCurrency(Math.max(0, realValue))}
+                                            {realValue >= 0 ? (t.type === 'entrada' ? '+' : '-') : (t.type === 'entrada' ? '-' : '+')} {formatCurrency(Math.abs(realValue))}
                                           </p>
                                         </div>
                                         {t.status === 'pendente' && (
@@ -4746,185 +4946,154 @@ function MainApp() {
             )}
 
             {activeTab === 'ai' && (
-              <motion.div key="ai" initial={{ opacity: 0, scale: 0.98 }} animate={{ opacity: 1, scale: 1 }} className="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-8">
-                <Card className="p-10 flex flex-col items-center text-center gap-8 border-emerald-500/20 relative overflow-hidden">
-                  <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-emerald-500 to-transparent" />
-                  <div className="w-24 h-24 bg-emerald-500/20 rounded-[2.5rem] flex items-center justify-center animate-pulse">
-                    <Bot className="w-12 h-12 text-emerald-400" />
+              <motion.div key="ai" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="max-w-5xl mx-auto space-y-8">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                  {/* Sidebar - Info & Stats */}
+                  <div className="space-y-6">
+                    <Card className="p-8 border-emerald-500/20 bg-emerald-500/5">
+                      <div className="flex items-center gap-4 mb-6">
+                        <div className="p-3 bg-emerald-500/20 rounded-2xl text-emerald-400"><Database className="w-5 h-5" /></div>
+                        <div>
+                          <p className="text-[10px] font-black text-emerald-500 uppercase tracking-widest leading-none">Contexto Injetado</p>
+                          <h4 className="text-white font-bold">Estado Dinâmico</h4>
+                        </div>
+                      </div>
+                      <div className="space-y-4">
+                        <div className="flex justify-between items-center text-[11px]">
+                          <span className="text-slate-500 uppercase font-bold tracking-wider">Perfis Mapeados</span>
+                          <span className="text-white font-mono bg-white/5 px-2 py-0.5 rounded-md">{allProfiles.length}</span>
+                        </div>
+                        <div className="flex justify-between items-center text-[11px]">
+                          <span className="text-slate-500 uppercase font-bold tracking-wider">Classes Identificadas</span>
+                          <span className="text-white font-mono bg-white/5 px-2 py-0.5 rounded-md">{categories.length}</span>
+                        </div>
+                        <div className="flex justify-between items-center text-[11px]">
+                          <span className="text-slate-500 uppercase font-bold tracking-wider">Amostra de Lançamentos</span>
+                          <span className="text-white font-mono bg-white/5 px-2 py-0.5 rounded-md">{Math.min(50, transactions.length)}</span>
+                        </div>
+                        <div className="pt-4 border-t border-white/5">
+                          <p className="text-[9px] text-slate-500 uppercase font-bold leading-relaxed">
+                            A IA agora possui "consciência situcional" total do seu banco de dados local e nuvem.
+                          </p>
+                        </div>
+                      </div>
+                    </Card>
+
+                    <Card className="p-8 border-blue-500/20">
+                      <h4 className="text-sm font-black text-white uppercase tracking-widest mb-4">Exemplos de Comandos</h4>
+                      <div className="space-y-2">
+                        {['"Crie uma despesa de R$ 50 no Mercado hoje"', '"Altere o valor do Aluguel de ontem para 1500"', '"Exclua o último pix recebido"', '"Anexe 10 reais de taxa na conta Salário"'].map((txt, i) => (
+                          <button 
+                            key={i} 
+                            onClick={() => setCurrentAiMessage(txt.replace(/"/g, ''))}
+                            className="w-full text-left p-3 rounded-xl bg-white/5 hover:bg-white/10 transition-all text-[10px] text-slate-400 font-medium border border-transparent hover:border-white/10"
+                          >
+                            {txt}
+                          </button>
+                        ))}
+                      </div>
+                    </Card>
                   </div>
-                  <div className="space-y-4">
-                    <h2 className="text-3xl font-black text-white">Assistente Mestre</h2>
-                    <div className="text-slate-400 text-sm leading-relaxed max-w-sm flex flex-col gap-2">
-                      <p className="font-bold text-white mb-2">Siga estes passos:</p>
-                      <p>1️⃣ Copie o Prompt Mestre.</p>
-                      <p>2️⃣ Cole no seu ChatGPT, Gemini ou Claude.</p>
-                      <p>3️⃣ Dite seus gastos.</p>
-                      <p>4️⃣ Copie a resposta gerada e cole no Importador Inteligente abaixo.</p>
-                      <p className="mt-2 text-[10px] uppercase font-black text-slate-600">Dica: Se a lista for muito gigante, peça para a IA gerar um arquivo .json e use o botão de importar arquivo.</p>
+
+                  {/* Chat Interface */}
+                  <div className="lg:col-span-2 space-y-4 flex flex-col h-[700px]">
+                    <div className="flex-1 bg-slate-900/50 backdrop-blur-xl border border-white/5 rounded-[2.5rem] overflow-hidden flex flex-col shadow-2xl">
+                      {/* Header */}
+                      <div className="p-6 border-b border-white/5 flex items-center justify-between bg-white/5">
+                        <div className="flex items-center gap-4">
+                          <div className="w-12 h-12 bg-emerald-500/20 rounded-2xl flex items-center justify-center">
+                            <Bot className="w-6 h-6 text-emerald-400" />
+                          </div>
+                          <div>
+                            <h3 className="text-lg font-black text-white leading-none">Mestre VerdeGrana</h3>
+                            <span className="text-[9px] text-emerald-500 font-black uppercase tracking-widest">Motor Neural Ativo</span>
+                          </div>
+                        </div>
+                        <button onClick={() => setAiChatHistory([])} className="p-3 text-slate-600 hover:text-rose-500 transition-colors">
+                          <Trash2 className="w-5 h-5" />
+                        </button>
+                      </div>
+
+                      {/* Messages Area */}
+                      <div className="flex-1 overflow-y-auto p-8 space-y-6 custom-scrollbar">
+                        {aiChatHistory.length === 0 ? (
+                          <div className="h-full flex flex-col items-center justify-center text-center gap-6 opacity-40">
+                            <Sparkles className="w-16 h-16 text-emerald-500 animate-pulse" />
+                            <div className="max-w-xs">
+                              <p className="text-white font-bold">Como posso comandar suas finanças hoje?</p>
+                              <p className="text-[10px] uppercase font-black tracking-widest mt-2">Diga o que fazer e eu opero o sistema por você.</p>
+                            </div>
+                          </div>
+                        ) : (
+                          aiChatHistory.map((msg, i) => (
+                            <div key={i} className={cn("flex flex-col gap-2", msg.role === 'user' ? "items-end" : "items-start")}>
+                              <div className={cn(
+                                "max-w-[85%] p-5 rounded-[2rem]",
+                                msg.role === 'user' ? "bg-emerald-500 text-slate-950 font-bold rounded-tr-none" : "bg-white/5 text-slate-300 rounded-tl-none border border-white/5"
+                              )}>
+                                <p className="text-sm whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+                              </div>
+                              {msg.role === 'assistant' && msg.operations && msg.operations.length > 0 && (
+                                <button 
+                                  onClick={() => {
+                                    executeAiOperations(msg.operations!);
+                                    // Remove operations from this message once executed to avoid double execution
+                                    const newHistory = [...aiChatHistory];
+                                    newHistory[i].operations = undefined;
+                                    setAiChatHistory(newHistory);
+                                  }}
+                                  className="mt-2 flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-500 transition-all shadow-lg shadow-blue-600/20"
+                                >
+                                  <Zap className="w-4 h-4" /> Executar {msg.operations.length} Operações
+                                </button>
+                              )}
+                            </div>
+                          ))
+                        )}
+                        {isAiProcessing && (
+                          <div className="flex items-start gap-4">
+                            <div className="w-10 h-10 bg-emerald-500/20 rounded-xl flex items-center justify-center animate-spin">
+                              <Bot className="w-5 h-5 text-emerald-400" />
+                            </div>
+                            <div className="p-5 bg-white/5 rounded-[2rem] rounded-tl-none border border-white/5 animate-pulse">
+                              <p className="text-[10px] font-black uppercase tracking-widest text-emerald-500">Mestre está computando...</p>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Input Area */}
+                      <div className="p-8 border-t border-white/5 bg-white/5">
+                        <div className="relative">
+                          <textarea 
+                            value={currentAiMessage}
+                            onChange={(e) => setCurrentAiMessage(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault();
+                                handleAiChat();
+                              }
+                            }}
+                            placeholder="Comande o sistema aqui..." 
+                            className="w-full h-20 bg-slate-900 border border-white/5 rounded-3xl p-6 pr-32 text-sm text-white outline-none focus:border-emerald-500/50 resize-none transition-all"
+                          />
+                          <div className="absolute right-4 bottom-4 flex items-center gap-2">
+                             <button 
+                              onClick={handleAiChat}
+                              disabled={isAiProcessing || !currentAiMessage.trim()}
+                              className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center text-slate-950 hover:bg-emerald-400 transition-all disabled:opacity-50"
+                             >
+                                <Send className="w-5 h-5" />
+                             </button>
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   </div>
-                  <div className="w-full space-y-3">
-                    <div className="p-4 bg-emerald-500/5 border border-emerald-500/10 rounded-2xl text-left flex items-center gap-3 mb-2">
-                       <User className="w-4 h-4 text-emerald-500" />
-                       <div className="leading-none">
-                         <p className="text-[9px] font-black text-emerald-500 uppercase">Perfil Alvo</p>
-                         <p className="text-white text-xs font-bold">{activeProfile}</p>
-                       </div>
-                    </div>
-                    <button 
-                      onClick={() => {
-                        const validParents = profileTransactions.filter(t => !t.parent_id).map(t => t.desc);
-                        const prompt = `Você é um assistente financeiro mestre e motor de parsing para o app VerdeGrana.
-Sua missão é converter descrições financeiras em um objeto estruturado para o sistema.
-
-REGRAS DE INTERAÇÃO (CRÍTICO):
-- Se o usuário disser "Olá", "Oi" ou saudações similares, responda de forma extremamente amigável, educada e prestativa em português, perguntando como pode ajudar a organizar as finanças hoje. NÃO envie JSON nestas saudações iniciais.
-- Só envie o JSON quando houver dados financeiros (extratos, falas de gastos, pedidos de alteração) para processar.
-
-ESTRUTURA DE RESPOSTA PARA DADOS (JSON BRUTO, SEM CÓDIGO MD):
-{
-  "user_friendly_summary": "Um texto amigável, legível e em tópicos detalhando exatamente o que foi processado.",
-  "transactions": [
-    {
-      "operation": "insert|update|delete",
-      "id": "UUID (se novo) ou ID existente",
-      "date": "YYYY-MM-DD",
-      "desc": "string",
-      "value": number (positivo),
-      "category": "string",
-      "type": "entrada|saída",
-      "status": "realizado|pendente",
-      "parent_name": "NOME DA CONTA PAI EXATA",
-      "is_redutora": boolean
-    }
-  ]
-}
-
-REGRAS DE LÓGICA E CONTABILIDADE:
-1. SUBCOTAS / PARENT_NAME:
-   - Use 'parent_name' APENAS se o usuário citar explicitamente uma destas contas existentes: [${validParents.length > 0 ? validParents.join(', ') : 'Nenhuma conta principal cadastrada ainda'}]. 
-   - Se a conta citada não estiver na lista acima, ignore o parent_name ou sugira a criação. NÃO invente nomes de contas.
-2. IS_REDUTORA (DEFINIÇÃO EXATA):
-   - is_redutora: true -> APENAS para sub-itens que DIMINUEM o valor do pai (ex: Imposto Retido no Salário, Desconto em Compra).
-   - is_redutora: false -> Para despesas normais, adições ou lançamentos padrão, mesmo que vinculados a um pai.
-3. CATEGORIAS: [${categories.map(c => c.name).join(', ')}]. Use 'Outros' se necessário.
-4. RESPOSTA DE DADOS: Retire qualquer bloco de código Markdown (\`\`\`json). Envie apenas o objeto {}.`;
-
-                        navigator.clipboard.writeText(prompt);
-                        toast.success('Prompt mestre atualizado e copiado!');
-                      }}
-                      className="w-full py-5 bg-emerald-600 rounded-3xl font-bold hover:bg-emerald-500 transition-all shadow-xl shadow-emerald-600/30 flex items-center justify-center gap-3"
-                    >
-                      <Copy className="w-5 h-5" /> Copiar Master Prompt
-                    </button>
-                  </div>
-                </Card>
-
-                <Card className="p-10 flex flex-col gap-8">
-                  <div className="flex items-center gap-4">
-                    <div className="p-3 bg-blue-500/20 rounded-2xl text-blue-400"><RefreshCw className={isAiProcessing ? "animate-spin" : ""} /></div>
-                    <h3 className="text-xl font-bold text-white">Importador Inteligente</h3>
-                  </div>
-                  <div className="relative group">
-                    <textarea 
-                      id="ai-json" placeholder="Cole o JSON da IA ou use o microfone para descrever..." 
-                      className="w-full min-h-[300px] bg-black/40 border border-white/5 rounded-[2rem] p-8 text-xs font-mono text-emerald-500 focus:border-emerald-500/50 outline-none resize-none"
-                    />
-                    <div className="absolute bottom-6 right-6 flex gap-2">
-                       <button 
-                        onClick={() => {
-                          const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-                          if (!SpeechRecognition) {
-                            toast.error("Reconhecimento de voz não suportado neste navegador.");
-                            return;
-                          }
-                          const recognition = new SpeechRecognition();
-                          recognition.lang = 'pt-BR';
-                          recognition.start();
-                          toast.info("Ouvindo... Fale sua instrução.");
-                          recognition.onresult = (event: any) => {
-                            const text = event.results[0][0].transcript;
-                            const area = document.getElementById('ai-json') as HTMLTextAreaElement;
-                            area.value = (area.value ? area.value + "\n" : "") + "COMANDO DE VOZ: " + text;
-                            toast.success("Voz capturada! Copie o texto e peça para a IA gerar o JSON.");
-                          };
-                        }}
-                        className="p-4 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-500 rounded-2xl border border-emerald-500/20 transition-all"
-                        title="Ditar Comando"
-                       >
-                         <Mic className="w-5 h-5" />
-                       </button>
-                    </div>
-                  </div>
-                  <button 
-                    onClick={() => {
-                      setIsAiProcessing(true);
-                      const area = document.getElementById('ai-json') as HTMLTextAreaElement;
-                      if (!area.value.trim()) {
-                        toast.error("Cole o JSON primeiro!");
-                        setIsAiProcessing(false);
-                        return;
-                      }
-                      setTimeout(() => {
-                        try {
-                          const text = area.value.trim();
-                          const start = text.indexOf('{');
-                          const end = text.lastIndexOf('}');
-                          
-                          if (start === -1 || end === -1 || end <= start) {
-                            throw new Error("JSON não encontrado no texto.");
-                          }
-
-                          const jsonStr = text.substring(start, end + 1);
-                          const data = JSON.parse(jsonStr);
-                          processImport(data);
-                          area.value = '';
-                        } catch (e) { 
-                          console.error("JSON Error:", e);
-                          toast.error('Falha ao extrair dados. Certifique-se de colar a resposta completa da IA.'); 
-                        }
-                        setIsAiProcessing(false);
-                      }, 1000);
-                    }}
-                    disabled={isAiProcessing}
-                    className="w-full py-5 bg-blue-600 rounded-3xl font-bold flex items-center justify-center gap-3 hover:bg-blue-500 transition-all shadow-xl shadow-blue-600/30 disabled:opacity-50"
-                  >
-                    {isAiProcessing ? 'Processando...' : 'Processar'}
-                  </button>
-
-                  <input 
-                    type="file" 
-                    ref={fileInputRef} 
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (!file) return;
-                      const reader = new FileReader();
-                      reader.onload = (event) => {
-                        try {
-                          const text = event.target?.result as string;
-                          const data = JSON.parse(text);
-                          processImport(Array.isArray(data) ? data : data.transactions || []);
-                          setActiveTab('reports');
-                          toast.success('Dados importados com sucesso!');
-                        } catch (err) {
-                          toast.error('Erro ao processar arquivo.');
-                        }
-                      };
-                      reader.readAsText(file);
-                      e.target.value = '';
-                    }}
-                    className="hidden"
-                    accept=".json,.txt"
-                  />
-                  <button 
-                    onClick={() => fileInputRef.current?.click()}
-                    className="w-full py-5 bg-white/5 border border-white/10 rounded-3xl text-slate-300 font-bold hover:bg-white/10 transition-all flex items-center justify-center gap-3"
-                  >
-                    <FileJson className="w-5 h-5 text-blue-400" /> Importar via Arquivo
-                  </button>
-                </Card>
-
-                <Card className="col-span-1 lg:col-span-2 p-10 flex flex-col gap-6 border-blue-500/10">
+                </div>
+                
+                {/* Export Options Card - Re-merged for advanced analysis */}
+                <Card className="p-10 flex flex-col gap-6 border-blue-500/10 mt-8">
                   <div className="flex flex-col gap-2">
                     <h3 className="text-xl font-bold text-white">Análise Avançada com IA</h3>
                     <p className="text-slate-500 text-sm">Seus dados não têm limites. Exporte seu histórico e peça para a sua IA favorita gerar planilhas do Excel, gráficos personalizados ou análises profundas sobre sua saúde financeira.</p>
@@ -5768,12 +5937,20 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                 let parent_id = selectedParentId;
 
                 // Logic for "Anexo" mode
+                let impact_type: 'aumentar' | 'diminuir' | 'neutro' = 'aumentar';
                 if (isAnexo && parent_id) {
                   const parent = profileTransactions.find(t => t.id === parent_id);
                   if (parent) {
-                    type = parent.type; // Adopt parent type
-                    const fluxValue = fd.get('flux_anexo');
-                    is_redutora = fluxValue === 'diminuir';
+                    const fluxValue = fd.get('flux_anexo') as 'aumentar' | 'diminuir' | 'neutro';
+                    impact_type = fluxValue;
+                    
+                    // If diminishing and same type as parent, it's a redutora
+                    // If different type, it diminishes by nature, but we set is_redutora=false to avoid double negation in stats logic
+                    if (type === parent.type) {
+                      is_redutora = fluxValue === 'diminuir';
+                    } else {
+                      is_redutora = false; 
+                    }
                   }
                 }
 
@@ -5786,6 +5963,7 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                   profile_name: activeProfile,
                   status: fd.get('status_toggle') === 'on' ? 'realizado' : 'pendente' as TransactionStatus,
                   is_redutora,
+                  impact_type: isAnexo ? impact_type : undefined,
                   parent_id: (isAnexo && parent_id && isUUID(parent_id)) ? parent_id : null,
                   parent_name: (isAnexo && parent_id) ? profileTransactions.find(t => t.id === parent_id)?.desc : null
                 };
@@ -5983,18 +6161,23 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
                     </div>
                     <div className="flex flex-col gap-1.5">
                       <label className="text-[9px] uppercase font-black text-slate-600 ml-2">Fluxo</label>
-                      {isAnexo ? (
-                        <select name="flux_anexo" defaultValue={editingTransaction?.is_redutora ? 'diminuir' : 'aumentar'} className="w-full h-11 bg-white/5 border border-white/5 rounded-2xl px-4 text-white outline-none focus:border-blue-500/50 transition-all appearance-none text-xs">
-                          <option value="aumentar" className="bg-slate-900">Aumentar o valor (+)</option>
-                          <option value="diminuir" className="bg-slate-900">Diminuir o valor (-)</option>
-                        </select>
-                      ) : (
-                        <select name="type" defaultValue={editingTransaction?.type || 'saída'} className="w-full h-11 bg-white/5 border border-white/5 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 transition-all appearance-none text-xs">
-                          <option value="entrada" className="bg-slate-900">Entrada (+)</option>
-                          <option value="saída" className="bg-slate-900">Saída (-)</option>
-                        </select>
-                      )}
+                      <select name="type" defaultValue={editingTransaction?.type || 'saída'} className="w-full h-11 bg-white/5 border border-white/5 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 transition-all appearance-none text-xs">
+                        <option value="entrada" className="bg-slate-900">Entrada (+)</option>
+                        <option value="saída" className="bg-slate-900">Saída (-)</option>
+                      </select>
                     </div>
+
+                    {isAnexo && (
+                      <div className="flex flex-col gap-1.5 col-span-2 mt-2 p-4 bg-blue-500/5 rounded-2xl border border-blue-500/10">
+                        <label className="text-[9px] uppercase font-black text-blue-400 ml-2">Impacto na Conta Principal</label>
+                        <select name="flux_anexo" defaultValue={editingTransaction?.impact_type || (editingTransaction?.is_redutora ? 'diminuir' : 'aumentar')} className="w-full h-11 bg-white/5 border border-white/5 rounded-2xl px-4 text-white outline-none focus:border-blue-500/50 transition-all appearance-none text-xs">
+                          <option value="aumentar" className="bg-slate-900">Soma ao valor do pai (+)</option>
+                          <option value="diminuir" className="bg-slate-900">Subtrai do valor do pai (-)</option>
+                          <option value="neutro" className="bg-slate-900">Não altera o valor do pai (Apenas vínculo)</option>
+                        </select>
+                        <p className="text-[8px] text-slate-500 font-bold uppercase tracking-widest mt-1 ml-2">Define como este sub-item afeta o total "Real" da conta principal</p>
+                      </div>
+                    )}
                   </div>
 
                   <div className="space-y-1.5">
@@ -6530,6 +6713,299 @@ SOLICITAÇÃO: Forneça uma análise crítica, insights de economia e recomenda�
               </div>
               
               <p className="text-[10px] text-slate-500 text-center uppercase tracking-widest">A versão descartada será substituída permanentemente.</p>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* FLOATING BULK EDIT BAR */}
+      <AnimatePresence>
+        {selectedTxIds.length > 0 && (
+          <motion.div
+            initial={{ y: 100, opacity: 0 }}
+            animate={{ y: 0, opacity: 1 }}
+            exit={{ y: 100, opacity: 0 }}
+            className="fixed bottom-[88px] left-1/2 -translate-x-1/2 z-[45] flex flex-col sm:flex-row items-stretch sm:items-center gap-4 bg-[#0f172a]/95 border border-emerald-500/20 px-6 py-4 rounded-3xl shadow-xl shadow-slate-950/80 backdrop-blur-xl w-[92vw] max-w-lg transition-all"
+          >
+            <div className="flex-1">
+              <p className="text-white font-black text-sm">
+                {selectedTxIds.length} {selectedTxIds.length === 1 ? 'registro selecionado' : 'registros selecionados'}
+              </p>
+              <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-0.5">Ações Rápidas em Massa</p>
+            </div>
+            
+            <div className="flex items-center gap-2 justify-end">
+              <button
+                onClick={() => setIsBulkEditModalOpen(true)}
+                className="flex items-center gap-2 px-3 py-2.5 bg-emerald-500 text-white font-bold rounded-2xl hover:bg-emerald-400 transition-all text-xs shadow-lg shadow-emerald-500/20"
+                title="Editar Selecionados"
+              >
+                <Edit3 size={15} />
+                <span>Editar</span>
+              </button>
+              
+              <button
+                onClick={async () => {
+                  if (confirm(`Deseja realmente excluir todos os ${selectedTxIds.length} lançamentos selecionados?`)) {
+                    await handleDeleteTransactions(selectedTxIds);
+                    setSelectedTxIds([]);
+                  }
+                }}
+                className="flex items-center gap-2 px-3 py-2.5 bg-red-500/20 text-red-400 font-bold border border-red-500/30 rounded-2xl hover:bg-red-500/30 transition-all text-xs"
+                title="Excluir Selecionados"
+              >
+                <Trash2 size={15} />
+                <span>Excluir</span>
+              </button>
+
+              <button
+                onClick={() => setSelectedTxIds([])}
+                className="p-2.5 bg-white/5 text-slate-400 rounded-2xl hover:bg-white/10 transition-all"
+                title="Desmarcar todos"
+              >
+                <X size={15} />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* BULK EDIT MODAL */}
+      <AnimatePresence>
+        {isBulkEditModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-end md:items-center justify-center p-0 md:p-6">
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 bg-slate-950/80 backdrop-blur-md" onClick={() => setIsBulkEditModalOpen(false)} />
+            <motion.div 
+              initial={{ y: 100, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: 600, opacity: 0 }}
+              className="relative w-full max-w-2xl bg-[#0f172a]/95 backdrop-blur-md md:glass p-6 md:p-8 rounded-t-[3rem] md:rounded-[3rem] border-t md:border border-white/10 shadow-2xl max-h-[90vh] flex flex-col"
+            >
+              <div className="flex justify-between items-center mb-6 shrink-0">
+                <div>
+                  <h2 className="text-2xl font-black text-white tracking-tighter uppercase">Alterar em Massa</h2>
+                  <p className="text-slate-400 text-xs font-semibold uppercase tracking-widest mt-1">
+                    Selecionados: <span className="text-emerald-400 font-bold">{selectedTxIds.length} registros</span>
+                  </p>
+                </div>
+                <button onClick={() => setIsBulkEditModalOpen(false)} className="p-3 bg-white/5 rounded-full hover:bg-white/10 transition-all"><X/></button>
+              </div>
+
+              <div className="text-amber-500/95 text-[10px] font-bold p-3 bg-amber-500/10 rounded-2xl border border-amber-500/20 mb-4 tracking-wider uppercase leading-relaxed">
+                ⚠️ marque apenas os que deseja alterar em todos. Os desmarcados não sofrerão alteração.
+              </div>
+
+              <form 
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  const fd = new FormData(e.currentTarget);
+                  
+                  const updateData: Partial<Transaction> = {};
+
+                  if (fd.get('bulk_date_toggle') === 'on') {
+                    const dateType = fd.get('bulk_pending_date_type');
+                    if (dateType === 'indefinida') {
+                      updateData.date = '2099-12-31';
+                    } else {
+                      updateData.date = fd.get('bulk_date') as string;
+                    }
+                  }
+
+                  if (fd.get('bulk_desc_toggle') === 'on') {
+                    updateData.desc = fd.get('bulk_desc') as string;
+                  }
+
+                  if (fd.get('bulk_value_toggle') === 'on') {
+                    updateData.value = parseFloat(fd.get('bulk_value') as string);
+                  }
+
+                  if (fd.get('bulk_category_toggle') === 'on') {
+                    updateData.category = fd.get('bulk_category') as string;
+                  }
+
+                  if (fd.get('bulk_type_toggle') === 'on') {
+                    updateData.type = fd.get('bulk_type') as 'entrada' | 'saída';
+                  }
+
+                  if (fd.get('bulk_status_toggle') === 'on') {
+                    updateData.status = (fd.get('bulk_status') === 'realizado') ? 'realizado' : 'pendente';
+                  }
+
+                  if (fd.get('bulk_redutora_toggle') === 'on') {
+                    updateData.is_redutora = fd.get('bulk_redutora') === 'on';
+                  }
+
+                  if (fd.get('bulk_parent_toggle') === 'on') {
+                    const val = fd.get('bulk_parent_id') as string;
+                    updateData.parent_id = val || null;
+                    if (val) {
+                      const parentObj = profileTransactions.find(t => t.id === val);
+                      updateData.parent_name = parentObj?.desc || null;
+                      
+                      const impact = fd.get('bulk_impact_type') as 'aumentar' | 'diminuir' | 'neutro';
+                      updateData.impact_type = impact;
+                      
+                      // Logic consistency for bulk: if attached as "diminuir" and type matches, mark as redutora
+                      const currentType = updateData.type || fd.get('bulk_type') as TransactionType;
+                      if (currentType === parentObj?.type) {
+                        updateData.is_redutora = (impact === 'diminuir');
+                      } else {
+                        updateData.is_redutora = false;
+                      }
+                    } else {
+                      updateData.parent_name = null;
+                      updateData.impact_type = undefined;
+                      updateData.is_redutora = false;
+                    }
+                  }
+
+                  await handleBulkUpdateTransactions(selectedTxIds, updateData);
+                  setIsBulkEditModalOpen(false);
+                  setSelectedTxIds([]);
+                }}
+                className="flex-1 overflow-y-auto pr-2 space-y-5 custom-scrollbar pb-6"
+              >
+                {/* 1. DATA */}
+                <div className="p-4 bg-white/2 rounded-2xl border border-white/5 space-y-4">
+                  <label className="flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" name="bulk_date_toggle" className="w-4 h-4 rounded-md border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-slate-900" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">Alterar Data</span>
+                  </label>
+                  
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pl-7">
+                    <select name="bulk_pending_date_type" defaultValue="defined" className="h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 text-xs">
+                      <option value="defined" className="bg-slate-900">Data Definida / Lançamento Único</option>
+                      <option value="indefinida" className="bg-slate-900">Sem Data Definida ("DATA INDEFINIDA")</option>
+                    </select>
+                    <input name="bulk_date" type="date" defaultValue={new Date().toISOString().split('T')[0]} className="h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 font-mono text-xs" />
+                  </div>
+                </div>
+
+                {/* 2. DESCRIÇÃO */}
+                <div className="p-4 bg-white/2 rounded-2xl border border-white/5 space-y-4">
+                  <label className="flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" name="bulk_desc_toggle" className="w-4 h-4 rounded-md border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">Alterar Descrição</span>
+                  </label>
+                  <div className="pl-7">
+                    <input name="bulk_desc" placeholder="Ex: Mensalidade, Assinatura, etc..." className="w-full h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 text-xs" />
+                  </div>
+                </div>
+
+                {/* 3. VALOR */}
+                <div className="p-4 bg-white/2 rounded-2xl border border-white/5 space-y-4">
+                  <label className="flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" name="bulk_value_toggle" className="w-4 h-4 rounded-md border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">Alterar Valor</span>
+                  </label>
+                  <div className="pl-7">
+                    <input name="bulk_value" type="number" step="0.01" placeholder="0,00" className="w-full h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 text-base font-black" />
+                  </div>
+                </div>
+
+                {/* 4. CATEGORIA */}
+                <div className="p-4 bg-white/2 rounded-2xl border border-white/5 space-y-4">
+                  <label className="flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" name="bulk_category_toggle" className="w-4 h-4 rounded-md border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">Alterar Tag / Categoria</span>
+                  </label>
+                  <div className="pl-7">
+                    <select name="bulk_category" className="w-full h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 text-xs">
+                      {categories.reduce((acc: Category[], current) => {
+                        if (!acc.find(c => c.id === current.id)) acc.push(current);
+                        return acc;
+                      }, []).map(c => <option key={c.id} value={c.name} className="bg-slate-900">{c.name}</option>)}
+                    </select>
+                  </div>
+                </div>
+
+                {/* 5. TIPO E STATUS */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div className="p-4 bg-white/2 rounded-2xl border border-white/5 space-y-4">
+                    <label className="flex items-center gap-3 cursor-pointer">
+                      <input type="checkbox" name="bulk_type_toggle" className="w-4 h-4 rounded-md border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500" />
+                      <span className="text-xs font-bold text-white uppercase tracking-wider">Alterar Fluxo</span>
+                    </label>
+                    <div className="pl-7">
+                      <select name="bulk_type" defaultValue="saída" className="w-full h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 text-xs">
+                        <option value="saída" className="bg-slate-900">Saída (-)</option>
+                        <option value="entrada" className="bg-slate-900">Entrada (+)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="p-4 bg-white/2 rounded-2xl border border-white/5 space-y-4">
+                    <label className="flex items-center gap-3 cursor-pointer">
+                      <input type="checkbox" name="bulk_status_toggle" className="w-4 h-4 rounded-md border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500" />
+                      <span className="text-xs font-bold text-white uppercase tracking-wider">Alterar Status</span>
+                    </label>
+                    <div className="pl-7">
+                      <select name="bulk_status" defaultValue="realizado" className="w-full h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 text-xs">
+                        <option value="realizado" className="bg-slate-900">Realizado</option>
+                        <option value="pendente" className="bg-slate-900">Pendente</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 6. REDUTORA */}
+                <div className="p-4 bg-white/2 rounded-2xl border border-white/5 space-y-4">
+                  <label className="flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" name="bulk_redutora_toggle" className="w-4 h-4 rounded-md border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">Definir como Item Redutor</span>
+                  </label>
+                  <div className="pl-7 flex items-center justify-between">
+                    <span className="text-[10px] uppercase font-black tracking-widest text-slate-500">Subtrai do valor total da conta vinculada</span>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                      <input type="checkbox" name="bulk_redutora" className="sr-only peer" />
+                      <div className="w-9 h-5 bg-slate-800 rounded-full peer peer-checked:bg-blue-500 transition-all" />
+                      <div className="absolute left-[2px] top-[2px] w-4 h-4 bg-white rounded-full peer-checked:translate-x-4 transition-all" />
+                    </label>
+                  </div>
+                </div>
+
+                {/* 7. PARENT */}
+                <div className="p-4 bg-white/2 rounded-2xl border border-white/5 space-y-4">
+                  <label className="flex items-center gap-3 cursor-pointer">
+                    <input type="checkbox" name="bulk_parent_toggle" className="w-4 h-4 rounded-md border-white/10 bg-slate-900 text-emerald-500 focus:ring-emerald-500" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider">Alterar Conta Principal Vinculada (Subconta)</span>
+                  </label>
+                  <div className="pl-7 space-y-3">
+                    <select name="bulk_parent_id" className="w-full h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 text-xs">
+                      <option value="">Sem vínculo (Conta Principal Independente)</option>
+                      {profileTransactions.filter(t => !t.parent_id).map((t, idx) => (
+                        <option key={`bulk-ext-${t.id}-${idx}`} value={t.id}>{t.desc}</option>
+                      ))}
+                    </select>
+
+                    <div className="space-y-1.5 pt-1">
+                      <label className="text-[10px] font-bold text-slate-400 uppercase tracking-widest pl-1">Impacto no valor da conta principal acima</label>
+                      <select name="bulk_impact_type" defaultValue="diminuir" className="w-full h-11 bg-slate-900 border border-white/10 rounded-2xl px-4 text-white outline-none focus:border-emerald-500/50 text-xs">
+                        <option value="diminuir" className="bg-slate-900 text-rose-400 font-bold">Diminuir o valor do pai (-)</option>
+                        <option value="aumentar" className="bg-slate-900 text-emerald-400 font-bold">Aumentar o valor do pai (+)</option>
+                        <option value="neutro" className="bg-slate-900 text-slate-400">Não alterar o valor (Apenas vínculo / Deixar como está)</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ACTIONS */}
+                <div className="pt-6 flex gap-4 shrink-0">
+                  <button 
+                    type="button" 
+                    onClick={() => setIsBulkEditModalOpen(false)} 
+                    className="flex-1 py-4 bg-white/5 border border-white/10 rounded-2xl font-bold hover:bg-white/10 transition-all text-xs"
+                  >
+                    Voltar
+                  </button>
+                  <button 
+                    type="submit" 
+                    className="flex-1 py-4 bg-emerald-600 rounded-2xl font-black hover:bg-emerald-500 transition-all shadow-xl shadow-emerald-500/20 text-xs text-white"
+                  >
+                    Aplicar Alterações em Massa
+                  </button>
+                </div>
+              </form>
             </motion.div>
           </div>
         )}
